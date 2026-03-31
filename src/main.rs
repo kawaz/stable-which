@@ -33,6 +33,25 @@ pub fn resolve_stable_path_with_env(
     binary: &Path,
     path_env: Option<std::ffi::OsString>,
 ) -> Result<ResolvedPath, String> {
+    // If the input has no path separator, treat it as a command name and look it up in PATH first.
+    let resolved_binary;
+    let binary = if !binary.to_string_lossy().contains('/') {
+        let name = binary
+            .file_name()
+            .ok_or_else(|| format!("'{}' has no file name", binary.display()))?;
+        resolved_binary = path_env
+            .as_ref()
+            .and_then(|pv| {
+                env::split_paths(pv)
+                    .map(|dir| dir.join(name))
+                    .find(|c| c.is_file())
+            })
+            .ok_or_else(|| format!("'{}' not found in PATH", binary.display()))?;
+        resolved_binary.as_path()
+    } else {
+        binary
+    };
+
     if !binary.exists() {
         return Err(format!("'{}' does not exist", binary.display()));
     }
@@ -87,10 +106,10 @@ fn print_help() {
 Resolve the stable PATH entry for a binary, verified by canonical path identity.
 
 Usage:
-    {NAME} [OPTIONS] <binary-path>
+    {NAME} [OPTIONS] <binary>
 
 Arguments:
-    <binary-path>    Path to the binary to resolve
+    <binary>         Path to the binary, or a command name to look up in PATH
 
 Options:
     --json           Output as JSON (default)
@@ -308,6 +327,30 @@ mod tests {
 
         assert!(!result.in_path);
         assert_eq!(result.path, fs::canonicalize(&f.real_binary).unwrap());
+    }
+
+    #[test]
+    fn test_command_name_lookup() {
+        let f = TestFixture::new();
+        let path_env = f.make_path(&[&f.stable_dir]);
+
+        // Pass just the command name (no path separator)
+        let result = resolve_stable_path_with_env(Path::new("mybinary"), Some(path_env)).unwrap();
+
+        assert!(result.in_path);
+        assert_eq!(result.path, f.stable_link);
+    }
+
+    #[test]
+    fn test_command_name_not_found() {
+        let f = TestFixture::new();
+        let empty_dir = f._tmpdir.path().join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+        let path_env = f.make_path(&[&empty_dir]);
+
+        let result = resolve_stable_path_with_env(Path::new("mybinary"), Some(path_env));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found in PATH"));
     }
 
     #[test]
