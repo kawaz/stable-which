@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -269,6 +270,7 @@ pub fn find_candidates_with_env(
 
     let mut candidates = Vec::new();
     let mut path_order: usize = 0;
+    let mut seen_paths = HashSet::new();
 
     // Add input path as a candidate with Input tag (no InPathEnv, no path_order)
     {
@@ -289,6 +291,10 @@ pub fn find_candidates_with_env(
                 continue;
             }
             if !version_manager::is_executable(&candidate_path) {
+                continue;
+            }
+            // Skip duplicate PATH entries (same directory appearing multiple times in PATH)
+            if !seen_paths.insert(candidate_path.clone()) {
                 continue;
             }
             let (mut tags, canonical) = tag_path(&candidate_path, &input_canonical, binary);
@@ -735,6 +741,23 @@ mod tests {
             .filter(|c| c.path == f.real_binary)
             .count();
         assert_eq!(count, 1, "input path should appear exactly once");
+    }
+
+    #[test]
+    fn test_duplicate_path_directory_deduped() {
+        let f = TestFixture::new();
+        // Same directory appears twice in PATH
+        let path_env = f.make_path(&[&f.stable_dir, &f.stable_dir]);
+
+        let candidates =
+            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
+                .unwrap();
+
+        let stable_count = candidates
+            .iter()
+            .filter(|c| c.path == f.stable_link)
+            .count();
+        assert_eq!(stable_count, 1, "duplicate PATH directory should be deduped");
     }
 
     #[test]
