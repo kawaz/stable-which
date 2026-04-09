@@ -59,4 +59,6 @@ release bump="patch":
     GIT_WORK_TREE="$(pwd)" git --git-dir="$(jj root)/../.git" push origin "v${new_version}"
 
     # Watch workflow
-    gh run watch
+    sleep 3
+    run_id=$(gh run list --repo kawaz/stable-which --limit 1 --json databaseId -q '.[0].databaseId')
+    gh run watch "$run_id" --repo kawaz/stable-which
