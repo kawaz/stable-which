@@ -52,13 +52,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && startsWith(matrix.target, 'aarch64')
         env:
           TARGET: ${{ matrix.target }}
-        run: cross build --release --target "$TARGET"
+        run: cross build --release --target "$TARGET" -p stable-which-cli
 
       - name: Build (native)
         if: "!(matrix.os == 'ubuntu-latest' && startsWith(matrix.target, 'aarch64'))"
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$TARGET"
+        run: cargo build --release --target "$TARGET" -p stable-which-cli
 
       - name: Package
         env:
