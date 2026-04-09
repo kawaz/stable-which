@@ -5,6 +5,7 @@ edition = "2024"
 description = "Evaluate binary path stability and find stable PATH candidates"
 license = "MIT"
 repository = "https://github.com/kawaz/stable-which"
+readme = "../../README.md"
 
 [dev-dependencies]
 tempfile = "3"
