@@ -1,3 +1,20 @@
+//! Evaluate binary path stability and find stable PATH candidates.
+//!
+//! This library analyzes binary paths, tags them with stability attributes
+//! (version manager, build output, ephemeral, shim, etc.), and scores them
+//! to find the most stable candidate for use in service registration,
+//! configuration files, or scripts.
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use stable_which::{find_candidates, ScoringPolicy};
+//! use std::path::Path;
+//!
+//! let candidates = find_candidates(Path::new("jj"), ScoringPolicy::SameBinary).unwrap();
+//! println!("Best: {}", candidates[0].path.display());
+//! ```
+
 pub mod candidate;
 pub mod version_manager;
 

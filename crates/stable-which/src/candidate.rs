@@ -61,7 +61,7 @@ pub enum PathTag {
     Shim,
     /// Canonical path matches the input binary (same file)
     SameCanonical,
-    /// File content hash matches the input binary (copied identical binary)
+    /// File content matches the input binary byte-for-byte (copied identical binary)
     SameContent,
     /// Relative path (doesn't start with /)
     Relative,
