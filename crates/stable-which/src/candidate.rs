@@ -279,7 +279,7 @@ pub fn find_candidates_with_env(
         let (mut tags, canonical) = tag_path(binary, &input_canonical, binary);
         tags.insert(0, PathTag::Input);
         candidates.push(Candidate {
-            path: binary.to_path_buf(),
+            path: canonical.clone(),
             canonical,
             tags,
         });
@@ -622,8 +622,11 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        let input_cand = candidates.iter().find(|c| c.path == f.real_binary).unwrap();
-        assert!(input_cand.tags.contains(&PathTag::Input));
+        let input_cand = candidates
+            .iter()
+            .find(|c| c.tags.contains(&PathTag::Input))
+            .unwrap();
+        assert_eq!(input_cand.path, input_cand.canonical);
     }
 
     #[test]
@@ -643,7 +646,10 @@ mod tests {
                 .any(|t| matches!(t, PathTag::InPathEnv(_)))
         );
         // Input candidate should NOT have InPathEnv
-        let input_cand = candidates.iter().find(|c| c.path == f.real_binary).unwrap();
+        let input_cand = candidates
+            .iter()
+            .find(|c| c.tags.contains(&PathTag::Input))
+            .unwrap();
         assert!(
             !input_cand
                 .tags
@@ -738,11 +744,11 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        let count = candidates
+        let input_count = candidates
             .iter()
-            .filter(|c| c.path == f.real_binary)
+            .filter(|c| c.tags.contains(&PathTag::Input))
             .count();
-        assert_eq!(count, 1, "input path should appear exactly once");
+        assert_eq!(input_count, 1, "input should appear exactly once");
     }
 
     #[test]
