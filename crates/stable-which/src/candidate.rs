@@ -75,6 +75,8 @@ pub enum PathTag {
     BuildOutput,
     /// Inside a temporary/cache directory
     Ephemeral,
+    /// Not directly executable (no execute permission, or ambiguous bare relative path)
+    NotExecutable,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +124,9 @@ impl Candidate {
         };
 
         let mut penalty = 0i32;
+        if self.tags.contains(&PathTag::NotExecutable) {
+            penalty -= 10000;
+        }
         if self.tags.contains(&PathTag::Relative) {
             penalty -= 3;
         }
@@ -149,6 +154,22 @@ impl Candidate {
             })
             .unwrap_or(usize::MAX)
     }
+}
+
+/// Normalize a path by resolving `.` and `..` components without touching symlinks.
+fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                result.pop();
+            }
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<PathTag>, PathBuf) {
@@ -226,6 +247,16 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
         tags.push(PathTag::Ephemeral);
     }
 
+    // NotExecutable: no execute permission, or bare relative path (no ./ or / prefix)
+    if !path_analysis::is_executable(path) {
+        tags.push(PathTag::NotExecutable);
+    } else if !path.is_absolute() {
+        let path_str = path.to_string_lossy();
+        if !path_str.starts_with("./") && !path_str.starts_with("../") {
+            tags.push(PathTag::NotExecutable);
+        }
+    }
+
     (tags, canonical)
 }
 
@@ -274,15 +305,82 @@ pub fn find_candidates_with_env(
     let mut path_order: usize = 0;
     let mut seen_paths = HashSet::new();
 
-    // Add input path as a candidate with Input tag (no InPathEnv, no path_order)
+    // Generate candidates from the input path itself:
+    // 1. Raw input (as-is)
     {
         let (mut tags, canonical) = tag_path(binary, &input_canonical, binary);
         tags.insert(0, PathTag::Input);
+        seen_paths.insert(binary.to_path_buf());
         candidates.push(Candidate {
-            path: canonical.clone(),
+            path: binary.to_path_buf(),
             canonical,
             tags,
         });
+    }
+
+    // 2. ./ prefixed (bare relative path → explicit relative path, if file exists)
+    if !binary.is_absolute() {
+        let path_str = binary.to_string_lossy();
+        if !path_str.starts_with("./") && !path_str.starts_with("../") && path_str.contains('/') {
+            let dot_prefixed = PathBuf::from(format!("./{path_str}"));
+            if dot_prefixed.exists() && !seen_paths.contains(&dot_prefixed) {
+                seen_paths.insert(dot_prefixed.clone());
+                let (tags, canonical) = tag_path(&dot_prefixed, &input_canonical, binary);
+                candidates.push(Candidate {
+                    path: dot_prefixed,
+                    canonical,
+                    tags,
+                });
+            }
+        }
+    }
+
+    // 3. Absolutized (relative → absolute, without resolving symlinks)
+    if !binary.is_absolute()
+        && let Ok(cwd) = env::current_dir()
+    {
+        let absolute = normalize_path(&cwd.join(binary));
+        if !seen_paths.contains(&absolute) {
+            seen_paths.insert(absolute.clone());
+            let (tags, canonical) = tag_path(&absolute, &input_canonical, binary);
+            candidates.push(Candidate {
+                path: absolute,
+                canonical,
+                tags,
+            });
+        }
+    }
+
+    // 3. Canonical (all symlinks resolved)
+    if !seen_paths.contains(&input_canonical) {
+        seen_paths.insert(input_canonical.clone());
+        let (tags, canonical) = tag_path(&input_canonical, &input_canonical, binary);
+        candidates.push(Candidate {
+            path: input_canonical.clone(),
+            canonical,
+            tags,
+        });
+    }
+
+    // 4. Symlink target (one level of resolution, if input is a symlink)
+    if let Ok(link_target) = fs::read_link(binary) {
+        let link_target = if link_target.is_relative() {
+            binary
+                .parent()
+                .map(|p| p.join(&link_target))
+                .unwrap_or(link_target)
+        } else {
+            link_target
+        };
+        if !seen_paths.contains(&link_target) {
+            seen_paths.insert(link_target.clone());
+            let (tags, canonical) = tag_path(&link_target, &input_canonical, binary);
+            candidates.push(Candidate {
+                path: link_target,
+                canonical,
+                tags,
+            });
+        }
     }
 
     // Search PATH for same-name binaries
@@ -562,8 +660,8 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        // Should have 2 candidates: input + symlink
-        assert_eq!(candidates.len(), 2);
+        // Should have at least 2 candidates: input (+ derived) + symlink from PATH
+        assert!(candidates.len() >= 2);
 
         // The symlink candidate should have SameCanonical tag
         let symlink_cand = candidates.iter().find(|c| c.path == f.stable_link).unwrap();
@@ -609,8 +707,9 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        assert_eq!(candidates.len(), 1);
-        assert!(candidates[0].tags.contains(&PathTag::Input));
+        // At least the input candidate (+ possibly canonical variant)
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().any(|c| c.tags.contains(&PathTag::Input)));
     }
 
     #[test]
@@ -622,11 +721,8 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        let input_cand = candidates
-            .iter()
-            .find(|c| c.tags.contains(&PathTag::Input))
-            .unwrap();
-        assert_eq!(input_cand.path, input_cand.canonical);
+        let input_cand = candidates.iter().find(|c| c.path == f.real_binary).unwrap();
+        assert!(input_cand.tags.contains(&PathTag::Input));
     }
 
     #[test]
@@ -646,10 +742,7 @@ mod tests {
                 .any(|t| matches!(t, PathTag::InPathEnv(_)))
         );
         // Input candidate should NOT have InPathEnv
-        let input_cand = candidates
-            .iter()
-            .find(|c| c.tags.contains(&PathTag::Input))
-            .unwrap();
+        let input_cand = candidates.iter().find(|c| c.path == f.real_binary).unwrap();
         assert!(
             !input_cand
                 .tags
@@ -744,11 +837,11 @@ mod tests {
             find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
                 .unwrap();
 
-        let input_count = candidates
+        let count = candidates
             .iter()
-            .filter(|c| c.tags.contains(&PathTag::Input))
+            .filter(|c| c.path == f.real_binary)
             .count();
-        assert_eq!(input_count, 1, "input should appear exactly once");
+        assert_eq!(count, 1, "input path should appear exactly once");
     }
 
     #[test]

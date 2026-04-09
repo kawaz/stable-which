@@ -46,6 +46,7 @@ fn tag_to_json(tag: &PathTag) -> serde_json::Value {
         PathTag::ManagedBy(name) => serde_json::json!({"managed-by": name}),
         PathTag::BuildOutput => serde_json::Value::String("build-output".into()),
         PathTag::Ephemeral => serde_json::Value::String("ephemeral".into()),
+        PathTag::NotExecutable => serde_json::Value::String("not-executable".into()),
         _ => serde_json::Value::String("unknown".into()),
     }
 }
