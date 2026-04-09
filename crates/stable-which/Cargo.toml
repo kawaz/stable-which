@@ -1,0 +1,10 @@
+[package]
+name = "stable-which"
+version = "0.2.0"
+edition = "2024"
+description = "Evaluate binary path stability and find stable PATH candidates"
+license = "MIT"
+repository = "https://github.com/kawaz/stable-which"
+
+[dev-dependencies]
+tempfile = "3"

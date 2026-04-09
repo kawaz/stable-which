@@ -6,20 +6,20 @@ default:
 
 # ビルド (release)
 build:
-    cargo build --release
+    cargo build --release -p stable-which-cli
 
 # テスト
 test:
-    cargo test
+    cargo test --workspace
 
 # lint + format チェック
 check:
-    cargo fmt --check
-    cargo clippy -- -D warnings
+    cargo fmt --check --all
+    cargo clippy --workspace -- -D warnings
 
 # format 適用
 fmt:
-    cargo fmt
+    cargo fmt --all
 
 # ビルドして実行
 run *ARGS: build
@@ -32,11 +32,11 @@ release bump="patch":
 
     # Pre-checks
     cargo fmt --check || { echo "Error: Run 'cargo fmt' first." >&2; exit 1; }
-    cargo clippy -- -D warnings
-    cargo test
+    cargo clippy --workspace -- -D warnings
+    cargo test --workspace
 
-    # Version bump
-    current=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    # Version bump (update both crate Cargo.toml files)
+    current=$(grep '^version' crates/stable-which/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     IFS='.' read -r major minor patchv <<< "$current"
     case "{{bump}}" in
         major) major=$((major + 1)); minor=0; patchv=0 ;;
@@ -45,7 +45,7 @@ release bump="patch":
         *) echo "Error: Invalid bump type '{{bump}}'" >&2; exit 1 ;;
     esac
     new_version="${major}.${minor}.${patchv}"
-    sed -i '' "s/^version = \"${current}\"/version = \"${new_version}\"/" Cargo.toml
+    sed -i '' "s/^version = \"${current}\"/version = \"${new_version}\"/" crates/stable-which/Cargo.toml crates/stable-which-cli/Cargo.toml
     cargo check --quiet
     echo "Version: ${current} -> ${new_version}"
 
