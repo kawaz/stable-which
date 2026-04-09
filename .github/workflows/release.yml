@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -90,6 +91,18 @@ jobs:
             --title "$TAG_NAME" \
             --generate-notes \
             stable-which-*.tar.gz
+
+  publish-crate:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        run: cargo publish -p stable-which
 
   update-homebrew:
     needs: release
