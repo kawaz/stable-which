@@ -159,8 +159,9 @@ pub fn files_have_same_content(path_a: &Path, path_b: &Path) -> bool {
         Err(_) => return false,
     };
 
-    let mut buf_a = [0u8; 8192];
-    let mut buf_b = [0u8; 8192];
+    // 64KB buffer: aligns with modern NVMe I/O and Apple Silicon 16KB pages
+    let mut buf_a = [0u8; 65536];
+    let mut buf_b = [0u8; 65536];
 
     loop {
         let n_a = match file_a.read(&mut buf_a) {
