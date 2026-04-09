@@ -759,7 +759,10 @@ mod tests {
             .iter()
             .filter(|c| c.path == f.stable_link)
             .count();
-        assert_eq!(stable_count, 1, "duplicate PATH directory should be deduped");
+        assert_eq!(
+            stable_count, 1,
+            "duplicate PATH directory should be deduped"
+        );
     }
 
     #[test]

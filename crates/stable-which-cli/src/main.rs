@@ -50,6 +50,17 @@ fn tag_to_json(tag: &PathTag) -> serde_json::Value {
     }
 }
 
+fn warn_different_binary(candidate: Option<&Candidate>) {
+    if let Some(c) = candidate
+        && c.tags.contains(&PathTag::DifferentBinary)
+    {
+        eprintln!(
+            "{NAME}: warning: best candidate '{}' is a different binary from the input",
+            c.path.display()
+        );
+    }
+}
+
 enum OutputFormat {
     Path,
     Json,
@@ -82,6 +93,7 @@ Options:
     --format <F>     Output format: path (default), json
     --policy <P>     Scoring policy: same-binary (default), stable
     --inspect        Show all candidates as JSON (same as --all --format json)
+    -q, --quiet      Suppress warnings
     --help           Show this help message
     --version        Show version"
     );
@@ -103,6 +115,7 @@ fn run() -> Result<(), String> {
     let mut show_all = false;
     let mut format = OutputFormat::Path;
     let mut policy = ScoringPolicy::SameBinary;
+    let mut quiet = false;
     let mut binary_path: Option<String> = None;
 
     let mut i = 0;
@@ -139,6 +152,7 @@ fn run() -> Result<(), String> {
                 show_all = true;
                 format = OutputFormat::Json;
             }
+            "-q" | "--quiet" => quiet = true,
             _ if args[i].starts_with('-') => {
                 return Err(format!("unknown option: {}", args[i]));
             }
@@ -160,6 +174,9 @@ fn run() -> Result<(), String> {
     if show_all {
         let candidates =
             find_candidates(Path::new(&binary_path), policy).map_err(|e| e.to_string())?;
+        if !quiet {
+            warn_different_binary(candidates.first());
+        }
         match format {
             OutputFormat::Path => {
                 for c in &candidates {
@@ -179,6 +196,9 @@ fn run() -> Result<(), String> {
     } else {
         let best =
             resolve_stable_path(Path::new(&binary_path), policy).map_err(|e| e.to_string())?;
+        if !quiet {
+            warn_different_binary(Some(&best));
+        }
         match format {
             OutputFormat::Path => {
                 println!("{}", best.path.display());
