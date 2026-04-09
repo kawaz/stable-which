@@ -156,6 +156,18 @@ impl Candidate {
     }
 }
 
+/// Normalize a path for deduplication (case insensitive on Windows)
+fn normalize_for_dedup(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// Normalize a path by resolving `.` and `..` components without touching symlinks.
 fn normalize_path(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -184,6 +196,8 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
     let path_str = path.to_string_lossy();
     if path_str.contains("/./")
         || path_str.contains("/../")
+        || path_str.contains("\\.\\")
+        || path_str.contains("\\..\\")
         || path.components().any(|c| {
             matches!(
                 c,
@@ -252,7 +266,11 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
         tags.push(PathTag::NotExecutable);
     } else if !path.is_absolute() {
         let path_str = path.to_string_lossy();
-        if !path_str.starts_with("./") && !path_str.starts_with("../") {
+        if !path_str.starts_with("./")
+            && !path_str.starts_with("../")
+            && !path_str.starts_with(".\\")
+            && !path_str.starts_with("..\\")
+        {
             tags.push(PathTag::NotExecutable);
         }
     }
@@ -265,18 +283,41 @@ pub fn find_candidates_with_env(
     path_env: Option<OsString>,
     policy: ScoringPolicy,
 ) -> Result<Vec<Candidate>, Error> {
-    // Command name resolution: if no '/' in path, look up in PATH
+    // Command name resolution: if no path separator, look up in PATH
     let resolved_binary;
-    let binary = if !binary.to_string_lossy().contains('/') {
+    let binary = if !binary.to_string_lossy().contains(std::path::MAIN_SEPARATOR)
+        && !binary.to_string_lossy().contains('/')
+    {
         let name = binary
             .file_name()
             .ok_or_else(|| Error::NoFileName(binary.to_path_buf()))?;
         resolved_binary = path_env
             .as_ref()
             .and_then(|pv| {
-                env::split_paths(pv)
-                    .map(|dir| dir.join(name))
-                    .find(|c| path_analysis::is_executable(c))
+                env::split_paths(pv).find_map(|dir| {
+                    // Try exact name first
+                    let exact = dir.join(name);
+                    if path_analysis::is_executable(&exact) {
+                        return Some(exact);
+                    }
+                    // On Windows, also try with PATHEXT extensions
+                    #[cfg(windows)]
+                    {
+                        let pathext = std::env::var("PATHEXT")
+                            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+                        for ext in pathext.split(';') {
+                            let with_ext = dir.join(format!(
+                                "{}{}",
+                                name.to_string_lossy(),
+                                ext.to_lowercase()
+                            ));
+                            if path_analysis::is_executable(&with_ext) {
+                                return Some(with_ext);
+                            }
+                        }
+                    }
+                    None
+                })
             })
             .ok_or_else(|| Error::NotInPath(binary.display().to_string()))?;
         resolved_binary.as_path()
@@ -310,7 +351,7 @@ pub fn find_candidates_with_env(
     {
         let (mut tags, canonical) = tag_path(binary, &input_canonical, binary);
         tags.insert(0, PathTag::Input);
-        seen_paths.insert(binary.to_path_buf());
+        seen_paths.insert(normalize_for_dedup(binary));
         candidates.push(Candidate {
             path: binary.to_path_buf(),
             canonical,
@@ -318,13 +359,20 @@ pub fn find_candidates_with_env(
         });
     }
 
-    // 2. ./ prefixed (bare relative path → explicit relative path, if file exists)
+    // 2. ./ or .\ prefixed (bare relative path -> explicit relative path, if file exists)
     if !binary.is_absolute() {
         let path_str = binary.to_string_lossy();
-        if !path_str.starts_with("./") && !path_str.starts_with("../") && path_str.contains('/') {
-            let dot_prefixed = PathBuf::from(format!("./{path_str}"));
-            if dot_prefixed.exists() && !seen_paths.contains(&dot_prefixed) {
-                seen_paths.insert(dot_prefixed.clone());
+        let has_explicit_prefix = path_str.starts_with("./")
+            || path_str.starts_with("../")
+            || path_str.starts_with(".\\")
+            || path_str.starts_with("..\\");
+        let has_separator = path_str.contains('/') || path_str.contains('\\');
+        if !has_explicit_prefix && has_separator {
+            let prefix = if cfg!(windows) { ".\\" } else { "./" };
+            let dot_prefixed = PathBuf::from(format!("{prefix}{path_str}"));
+            let dedup_key = normalize_for_dedup(&dot_prefixed);
+            if dot_prefixed.exists() && !seen_paths.contains(&dedup_key) {
+                seen_paths.insert(dedup_key);
                 let (tags, canonical) = tag_path(&dot_prefixed, &input_canonical, binary);
                 candidates.push(Candidate {
                     path: dot_prefixed,
@@ -335,13 +383,14 @@ pub fn find_candidates_with_env(
         }
     }
 
-    // 3. Absolutized (relative → absolute, without resolving symlinks)
+    // 3. Absolutized (relative -> absolute, without resolving symlinks)
     if !binary.is_absolute()
         && let Ok(cwd) = env::current_dir()
     {
         let absolute = normalize_path(&cwd.join(binary));
-        if !seen_paths.contains(&absolute) {
-            seen_paths.insert(absolute.clone());
+        let dedup_key = normalize_for_dedup(&absolute);
+        if !seen_paths.contains(&dedup_key) {
+            seen_paths.insert(dedup_key);
             let (tags, canonical) = tag_path(&absolute, &input_canonical, binary);
             candidates.push(Candidate {
                 path: absolute,
@@ -351,18 +400,21 @@ pub fn find_candidates_with_env(
         }
     }
 
-    // 3. Canonical (all symlinks resolved)
-    if !seen_paths.contains(&input_canonical) {
-        seen_paths.insert(input_canonical.clone());
-        let (tags, canonical) = tag_path(&input_canonical, &input_canonical, binary);
-        candidates.push(Candidate {
-            path: input_canonical.clone(),
-            canonical,
-            tags,
-        });
+    // 4. Canonical (all symlinks resolved)
+    {
+        let dedup_key = normalize_for_dedup(&input_canonical);
+        if !seen_paths.contains(&dedup_key) {
+            seen_paths.insert(dedup_key);
+            let (tags, canonical) = tag_path(&input_canonical, &input_canonical, binary);
+            candidates.push(Candidate {
+                path: input_canonical.clone(),
+                canonical,
+                tags,
+            });
+        }
     }
 
-    // 4. Symlink target (one level of resolution, if input is a symlink)
+    // 5. Symlink target (one level of resolution, if input is a symlink)
     if let Ok(link_target) = fs::read_link(binary) {
         let link_target = if link_target.is_relative() {
             binary
@@ -372,8 +424,9 @@ pub fn find_candidates_with_env(
         } else {
             link_target
         };
-        if !seen_paths.contains(&link_target) {
-            seen_paths.insert(link_target.clone());
+        let dedup_key = normalize_for_dedup(&link_target);
+        if !seen_paths.contains(&dedup_key) {
+            seen_paths.insert(dedup_key);
             let (tags, canonical) = tag_path(&link_target, &input_canonical, binary);
             candidates.push(Candidate {
                 path: link_target,
@@ -386,25 +439,42 @@ pub fn find_candidates_with_env(
     // Search PATH for same-name binaries
     if let Some(ref path_var) = path_env {
         for dir in env::split_paths(path_var) {
-            let candidate_path = dir.join(file_name);
-            if candidate_path == binary {
-                continue;
+            #[allow(unused_mut)]
+            let mut candidates_in_dir = vec![dir.join(file_name)];
+
+            // On Windows, also try PATHEXT extensions
+            #[cfg(windows)]
+            {
+                let pathext = std::env::var("PATHEXT")
+                    .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+                let name_str = file_name.to_string_lossy();
+                for ext in pathext.split(';') {
+                    candidates_in_dir
+                        .push(dir.join(format!("{}{}", name_str, ext.to_lowercase())));
+                }
             }
-            if !path_analysis::is_executable(&candidate_path) {
-                continue;
+
+            for candidate_path in candidates_in_dir {
+                if candidate_path == binary {
+                    continue;
+                }
+                if !path_analysis::is_executable(&candidate_path) {
+                    continue;
+                }
+                // Skip duplicate PATH entries (same directory appearing multiple times in PATH)
+                if !seen_paths.insert(normalize_for_dedup(&candidate_path)) {
+                    continue;
+                }
+                let (mut tags, canonical) =
+                    tag_path(&candidate_path, &input_canonical, binary);
+                tags.insert(0, PathTag::InPathEnv(path_order));
+                candidates.push(Candidate {
+                    path: candidate_path,
+                    canonical,
+                    tags,
+                });
+                path_order += 1;
             }
-            // Skip duplicate PATH entries (same directory appearing multiple times in PATH)
-            if !seen_paths.insert(candidate_path.clone()) {
-                continue;
-            }
-            let (mut tags, canonical) = tag_path(&candidate_path, &input_canonical, binary);
-            tags.insert(0, PathTag::InPathEnv(path_order));
-            candidates.push(Candidate {
-                path: candidate_path,
-                canonical,
-                tags,
-            });
-            path_order += 1;
         }
     }
 
@@ -438,6 +508,7 @@ pub fn resolve_stable_path(binary: &Path, policy: ScoringPolicy) -> Result<Candi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     // --- score() tests ---
@@ -603,6 +674,7 @@ mod tests {
 
     // --- find_candidates_with_env tests ---
 
+    #[cfg(unix)]
     struct TestFixture {
         _tmpdir: tempfile::TempDir,
         real_binary: PathBuf,
@@ -612,6 +684,7 @@ mod tests {
         other_dir: PathBuf,
     }
 
+    #[cfg(unix)]
     impl TestFixture {
         fn new() -> Self {
             let tmpdir = tempfile::tempdir().unwrap();
@@ -651,6 +724,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_symlink_same_canonical() {
         let f = TestFixture::new();
@@ -680,6 +754,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_different_binary_tagged() {
         let f = TestFixture::new();
@@ -696,6 +771,7 @@ mod tests {
         assert!(other_cand.tags.contains(&PathTag::DifferentBinary));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_no_path_matches_returns_input_only() {
         let f = TestFixture::new();
@@ -712,6 +788,7 @@ mod tests {
         assert!(candidates.iter().any(|c| c.tags.contains(&PathTag::Input)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_input_tag_present() {
         let f = TestFixture::new();
@@ -725,6 +802,7 @@ mod tests {
         assert!(input_cand.tags.contains(&PathTag::Input));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_in_path_env_tag_present() {
         let f = TestFixture::new();
@@ -751,6 +829,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_symlink_to_tag_present() {
         let f = TestFixture::new();
@@ -768,6 +847,7 @@ mod tests {
         assert!(has_symlink_tag);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_same_content_detected() {
         // Create a copy (not symlink) with identical content
@@ -796,6 +876,7 @@ mod tests {
         assert!(!copy_cand.tags.contains(&PathTag::SameCanonical));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_sorted_by_score_descending() {
         let f = TestFixture::new();
@@ -826,6 +907,7 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_duplicate_input_path_skipped() {
         // When input path is in PATH, it should not appear twice
@@ -844,6 +926,7 @@ mod tests {
         assert_eq!(count, 1, "input path should appear exactly once");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_duplicate_path_directory_deduped() {
         let f = TestFixture::new();
@@ -864,6 +947,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_command_name_lookup() {
         let f = TestFixture::new();
@@ -908,6 +992,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_shim_directory_detected() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -932,6 +1017,7 @@ mod tests {
         assert!(shim_cand.tags.contains(&PathTag::Shim));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_shim_by_symlink_name_mismatch() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -967,6 +1053,7 @@ mod tests {
         assert!(shim_cand.tags.contains(&PathTag::Shim));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_version_suffix_symlink_not_shim() {
         let tmpdir = tempfile::tempdir().unwrap();

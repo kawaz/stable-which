@@ -2,6 +2,11 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+/// Normalize path separators to '/' for pattern matching
+fn normalize_separators(path_str: &str) -> String {
+    path_str.replace('\\', "/")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionManagerInfo {
     pub name: String,
@@ -26,6 +31,9 @@ const INSTALL_PATTERNS: &[(&str, &str)] = &[
     ("/.goenv/versions/", "goenv"),
     ("/aquaproj-aqua/internal/pkgs/", "aqua"),
     ("/.proto/tools/", "proto"),
+    ("/scoop/apps/", "scoop"),
+    ("/chocolatey/lib/", "chocolatey"),
+    ("/WinGet/Packages/", "winget"),
 ];
 
 const SHIM_PATTERNS: &[&str] = &[
@@ -37,6 +45,8 @@ const SHIM_PATTERNS: &[&str] = &[
     "/.rbenv/shims/",
     "/.goenv/shims/",
     "/.proto/shims/",
+    "/scoop/shims/",
+    "/chocolatey/bin/",
 ];
 
 const BUILD_OUTPUT_PATTERNS: &[&str] = &[
@@ -63,7 +73,7 @@ const BUILD_OUTPUT_PATTERNS: &[&str] = &[
 
 /// Detect whether a path is under a version manager's install directory.
 pub fn detect_version_manager(path: &Path) -> Option<VersionManagerInfo> {
-    let s = path.to_string_lossy();
+    let s = normalize_separators(&path.to_string_lossy());
     for &(pattern, name) in INSTALL_PATTERNS {
         if s.contains(pattern) {
             return Some(VersionManagerInfo {
@@ -76,7 +86,7 @@ pub fn detect_version_manager(path: &Path) -> Option<VersionManagerInfo> {
 
 /// Detect whether a path is inside a shim directory.
 pub fn is_shim_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
+    let s = normalize_separators(&path.to_string_lossy());
     SHIM_PATTERNS.iter().any(|pattern| s.contains(pattern))
 }
 
@@ -89,7 +99,7 @@ pub fn is_shim_by_name(candidate_name: &str, symlink_target_name: &str) -> bool 
 
 /// Detect whether a path is inside a build output directory.
 pub fn is_build_output(path: &Path) -> bool {
-    let s = path.to_string_lossy();
+    let s = normalize_separators(&path.to_string_lossy());
     BUILD_OUTPUT_PATTERNS
         .iter()
         .any(|pattern| s.contains(pattern))
@@ -105,6 +115,8 @@ pub fn is_ephemeral(path: &Path) -> bool {
         Some(p) => p.to_string_lossy(),
         None => return false,
     };
+
+    let parent = normalize_separators(&parent);
 
     // .app bundle exclusion: only evaluate the path after .app/
     let check_target = if let Some(pos) = parent.find(".app/") {
@@ -124,13 +136,37 @@ pub fn is_ephemeral(path: &Path) -> bool {
     false
 }
 
-/// Check if a path is an executable file (Unix: has execute permission)
+/// Check if a path is an executable file
+#[cfg(unix)]
 pub fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match fs::metadata(path) {
         Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
         Err(_) => false,
     }
+}
+
+/// Check if a path is an executable file (Windows: match PATHEXT extensions)
+#[cfg(windows)]
+pub fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| {
+        ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PS1".to_string()
+    });
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => pathext
+            .split(';')
+            .any(|pe| pe.strip_prefix('.').is_some_and(|pe| pe.eq_ignore_ascii_case(ext))),
+        None => false,
+    }
+}
+
+/// Check if a path is an executable file (fallback for other platforms)
+#[cfg(not(any(unix, windows)))]
+pub fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Compare two files for byte-identical content.
@@ -648,6 +684,7 @@ mod tests {
 
     // --- is_executable ---
 
+    #[cfg(unix)]
     #[test]
     fn test_is_executable_true() {
         use std::os::unix::fs::PermissionsExt;
@@ -658,6 +695,7 @@ mod tests {
         assert!(is_executable(&path));
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_is_executable_false_no_exec_bit() {
         use std::os::unix::fs::PermissionsExt;
