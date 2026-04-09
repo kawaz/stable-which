@@ -240,14 +240,14 @@ dependencies = [
 
 [[package]]
 name = "stable-which"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "stable-which-cli"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde",
  "serde_json",
