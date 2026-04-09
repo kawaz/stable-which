@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::version_manager;
+use crate::path_analysis;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -180,7 +180,7 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
     }
 
     // Shim
-    if version_manager::is_shim_path(path) {
+    if path_analysis::is_shim_path(path) {
         tags.push(PathTag::Shim);
     } else if let Some(ref target) = symlink_target {
         let candidate_name = path
@@ -193,7 +193,7 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
             .unwrap_or_default();
         if !candidate_name.is_empty()
             && !target_name.is_empty()
-            && version_manager::is_shim_by_name(&candidate_name, &target_name)
+            && path_analysis::is_shim_by_name(&candidate_name, &target_name)
         {
             tags.push(PathTag::Shim);
         }
@@ -205,24 +205,24 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
     // SameCanonical / SameContent / DifferentBinary
     if canonical == input_canonical {
         tags.push(PathTag::SameCanonical);
-    } else if version_manager::files_have_same_content(path, input_path) {
+    } else if path_analysis::files_have_same_content(path, input_path) {
         tags.push(PathTag::SameContent);
     } else {
         tags.push(PathTag::DifferentBinary);
     }
 
     // ManagedBy
-    if let Some(info) = version_manager::detect_version_manager(path) {
+    if let Some(info) = path_analysis::detect_version_manager(path) {
         tags.push(PathTag::ManagedBy(info.name));
     }
 
     // BuildOutput
-    if version_manager::is_build_output(path) {
+    if path_analysis::is_build_output(path) {
         tags.push(PathTag::BuildOutput);
     }
 
     // Ephemeral
-    if version_manager::is_ephemeral(path) {
+    if path_analysis::is_ephemeral(path) {
         tags.push(PathTag::Ephemeral);
     }
 
@@ -245,7 +245,7 @@ pub fn find_candidates_with_env(
             .and_then(|pv| {
                 env::split_paths(pv)
                     .map(|dir| dir.join(name))
-                    .find(|c| version_manager::is_executable(c))
+                    .find(|c| path_analysis::is_executable(c))
             })
             .ok_or_else(|| Error::NotInPath(binary.display().to_string()))?;
         resolved_binary.as_path()
@@ -292,7 +292,7 @@ pub fn find_candidates_with_env(
             if candidate_path == binary {
                 continue;
             }
-            if !version_manager::is_executable(&candidate_path) {
+            if !path_analysis::is_executable(&candidate_path) {
                 continue;
             }
             // Skip duplicate PATH entries (same directory appearing multiple times in PATH)
