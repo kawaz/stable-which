@@ -31,7 +31,7 @@ release bump="patch":
     set -euo pipefail
 
     # Pre-checks
-    cargo fmt --check || { echo "Error: Run 'cargo fmt' first." >&2; exit 1; }
+    cargo fmt --check --all || { echo "Error: Run 'cargo fmt' first." >&2; exit 1; }
     cargo clippy --workspace -- -D warnings
     cargo test --workspace
 

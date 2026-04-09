@@ -49,6 +49,7 @@ impl std::error::Error for Error {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathTag {
     /// The path that was passed as input
     Input,
@@ -84,6 +85,7 @@ pub struct Candidate {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScoringPolicy {
     #[default]
     SameBinary,
