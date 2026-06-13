@@ -61,14 +61,10 @@ ensure-clean:
 # fail if bump-trigger-paths changed since main@origin but Cargo.toml version was not bumped
 # Note: Rust tests are embedded via #[cfg(test)] in source files (no separate *_test.rs),
 # so per-file test exclusion is not possible — crates/ is used as the trigger in full.
-# When main@origin lacks [workspace.package] (e.g. on first push after migration),
-# bump-semver compare exits 2; || true passes through to avoid over-blocking.
+# No diff vs main@origin -> pass; otherwise the version MUST be greater (compare gt fails -> push stops).
 [private]
-[script]
 check-version-bumped:
-    if ! bump-semver vcs diff -q main@origin -- Cargo.toml crates/; then
-        bump-semver compare gt Cargo.toml 'vcs:main@origin:Cargo.toml' || true
-    fi
+    bump-semver vcs diff -q main@origin -- Cargo.toml crates/ || bump-semver compare gt Cargo.toml 'vcs:main@origin:Cargo.toml'
 
 # translation pair freshness check via `bump-semver vcs outdated`
 [private]
@@ -79,14 +75,9 @@ check-outdated-translations: ensure-clean
 
 # bump Cargo.toml version (default: patch) and create a release commit
 bump-version level="patch": ensure-clean
-    #!/usr/bin/env bash
-    set -euo pipefail
     bump-semver "$1" Cargo.toml --write --quiet
-    # Regenerate Cargo.lock (the CLI path-dep carries no version to sync)
     cargo check --quiet
-    bump-semver vcs commit \
-      -m "Release v$(bump-semver get Cargo.toml)" \
-      Cargo.toml Cargo.lock
+    bump-semver vcs commit -m "Release v$(bump-semver get Cargo.toml)" Cargo.toml Cargo.lock
 
 # push to origin/main with gates
 push: ci check-outdated-translations check-version-bumped
