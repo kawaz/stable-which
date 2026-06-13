@@ -1183,6 +1183,14 @@ mod tests {
 
     // --- accessors / durability / 3-layer API ---
 
+    // The durable path (/opt/homebrew/bin/git) is a Unix absolute path.
+    // On Windows, Path::is_absolute() returns false for paths without a drive
+    // letter, so is_durable_direct_dir() returns false and the path falls
+    // through to Unknown instead of Durable → guard with #[cfg(unix)].
+    // The versioned path (/opt/homebrew/Cellar/…) matches VERSIONED_INSTALL_PATTERNS
+    // via substring ("/Cellar/") and would be NotDurable on any OS, but since
+    // it lives in the same test function it is guarded together.
+    #[cfg(unix)]
     #[test]
     fn test_durability_accessor_per_candidate() {
         // Reference surface is durable; versioned canonical is not.

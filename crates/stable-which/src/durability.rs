@@ -35,6 +35,21 @@ use crate::path_analysis;
 /// in the durable allow-list: they mix shebang-embedded scripts and versioned
 /// symlinks, so they fall through to `Unknown`.
 ///
+/// # Platform support
+///
+/// The durable location allow-list (step 2) is Unix-only: all entries in
+/// [`DURABLE_DIRECT_DIRS`] and the `/etc/profiles/per-user/<user>/bin/<file>`
+/// shape are Unix absolute paths (`/usr/bin`, `/opt/homebrew/bin`, etc.).
+/// On Windows, [`Path::is_absolute`] returns `false` for these Unix paths
+/// (no drive letter), so [`is_durable_direct_dir`] and
+/// [`is_etc_profiles_per_user_bin`] always return `false`.
+/// As a result, **on Windows all paths that do not match a `NotDurable`
+/// pattern fall through to `Unknown`** (the safe side).
+/// Windows-native durable surfaces (`C:\Windows\System32`, scoop/chocolatey/
+/// winget `bin` directories, PowerShell profile paths, etc.) are not yet in
+/// the allow-list and are planned for 0.5.x. See `docs/issue/` for the
+/// tracking issue.
+///
 /// # Known limitations
 ///
 /// Judgement is path-string based and cannot detect:
@@ -290,7 +305,12 @@ fn is_durable_location(path: &Path, home: Option<&Path>) -> bool {
 }
 
 /// Judge the durability of a candidate path, resolving HOME from the process
-/// environment. See [`Durability`].
+/// environment. See [`Durability`] for the judging model and platform notes.
+///
+/// On Windows, the durable location allow-list is not populated (all entries
+/// are Unix absolute paths), so paths that do not match a `NotDurable` pattern
+/// fall through to `Unknown` (safe side). Windows-native durable surfaces are
+/// planned for 0.5.x.
 pub fn judge(path: &Path) -> Durability {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     judge_with_home(path, home.as_deref())
@@ -442,42 +462,55 @@ mod tests {
     }
 
     // --- Durable: environment-wide reference surfaces ---
+    // These tests use Unix absolute paths (/usr/bin, /opt/homebrew/bin, etc.)
+    // and expect Durable.  On Windows, Path::is_absolute() returns false for
+    // paths without a drive letter, so is_durable_direct_dir() and
+    // is_etc_profiles_per_user_bin() always return false and these paths would
+    // fall through to Unknown.  Guard with #[cfg(unix)].
 
+    #[cfg(unix)]
     #[test]
     fn homebrew_bin_is_durable() {
         assert_eq!(judge_str("/opt/homebrew/bin/node"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn homebrew_sbin_is_durable() {
         assert_eq!(judge_str("/opt/homebrew/sbin/foo"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn usr_bin_is_durable() {
         assert_eq!(judge_str("/usr/bin/git"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn usr_sbin_is_durable() {
         assert_eq!(judge_str("/usr/sbin/foo"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sbin_is_durable() {
         assert_eq!(judge_str("/sbin/init"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn bin_is_durable() {
         assert_eq!(judge_str("/bin/sh"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn usr_local_bin_is_durable() {
         assert_eq!(judge_str("/usr/local/bin/node"), Durability::Durable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn mise_shim_is_durable() {
         assert_eq!(
@@ -486,6 +519,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_current_system_is_durable() {
         assert_eq!(
@@ -494,6 +528,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn etc_profiles_per_user_is_durable() {
         assert_eq!(
@@ -502,6 +537,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn nix_default_profile_is_durable() {
         assert_eq!(
@@ -576,6 +612,8 @@ mod tests {
         );
     }
 
+    // Unix absolute path + Durable expected → guard with #[cfg(unix)].
+    #[cfg(unix)]
     #[test]
     fn shim_anchored_under_home_is_durable() {
         assert_eq!(
@@ -648,6 +686,10 @@ mod tests {
 
     // --- helper-level direct tests ---
 
+    // The first assertion uses a Unix absolute path and expects true.
+    // On Windows, Path::is_absolute() returns false for paths without a drive
+    // letter, so is_durable_direct_dir() returns false → guard with #[cfg(unix)].
+    #[cfg(unix)]
     #[test]
     fn is_durable_direct_dir_exact_only() {
         assert!(is_durable_direct_dir(&PathBuf::from("/usr/bin/git")));
