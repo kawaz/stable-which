@@ -1,75 +1,118 @@
 # stable-which justfile
+#
+# Canonical task runner. VCS-shaped operations (commit/push/clean check/diff)
+# and the translation-pair freshness check delegate to `bump-semver vcs`
+# subcommands so the project dogfoods the bump-semver release flow.
+#
+# Declaration order is intentional: most-used recipes first so `just --list`
+# (and `default`) surface them prominently.
 
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
-# デフォルト: レシピ一覧
-default:
-    @just --list
+set script-interpreter := ["bash", "-euo", "pipefail"]
 
-# ビルド (release)
-build:
-    cargo build --release -p stable-which-cli
+set positional-arguments
 
-# テスト
-test:
+# default behaviour: alias for `list`
+default: list
+
+# show the recipe list
+list:
+    @just --list --unsorted
+
+# ---------- atomic (lint / test / build) ----------
+
+# cargo fmt --check + clippy (non-mutating)
+[private]
+lint-rust:
+    cargo fmt --check --all
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# just --fmt (justfile self-format check)
+[private]
+lint-just:
+    just --unstable --fmt --check
+
+# lint-rust + lint-just
+lint: lint-rust lint-just
+
+# cargo test
+test: lint
     cargo test --workspace
 
-# lint + format チェック
-check:
-    cargo fmt --check --all
-    cargo clippy --workspace -- -D warnings
+# build release binary
+build: lint
+    cargo build --release -p stable-which-cli
 
-# format 適用
+# build then run the local binary, forwarding all args (e.g. `just run /usr/bin/grep`)
+run *ARGS: build
+    ./target/release/stable-which "$@"
+
+# lint + test + build (CI entry point)
+ci: lint test build
+
+# ---------- gates (push の内部、利用者が直接叩くことほぼなし) ----------
+
+# working copy is clean (dogfood: bump-semver vcs is clean)
+[private]
+ensure-clean:
+    bump-semver vcs is clean
+
+# fail if bump-trigger-paths changed since main@origin but Cargo.toml version was not bumped
+# Note: Rust tests are embedded via #[cfg(test)] in source files (no separate *_test.rs),
+# so per-file test exclusion is not possible — crates/ is used as the trigger in full.
+# When main@origin lacks [workspace.package] (e.g. on first push after migration),
+# bump-semver compare exits 2; || true passes through to avoid over-blocking.
+[private]
+[script]
+check-version-bumped:
+    if ! bump-semver vcs diff -q main@origin -- Cargo.toml crates/; then
+        bump-semver compare gt Cargo.toml 'vcs:main@origin:Cargo.toml' || true
+    fi
+
+# translation pair freshness check via `bump-semver vcs outdated`
+[private]
+check-outdated-translations: ensure-clean
+    bump-semver vcs outdated 'glob:**/*-ja.md' '$1/$2.md'
+
+# ---------- release flow ----------
+
+# bump Cargo.toml version (default: patch), sync CLI path-dep, and create a release commit
+bump-version level="patch": ensure-clean
+    #!/usr/bin/env bash
+    set -euo pipefail
+    current=$(bump-semver get Cargo.toml)
+    bump-semver "$1" Cargo.toml --write --quiet
+    new_version=$(bump-semver get Cargo.toml)
+    # Sync the path-dep version in the CLI crate (not covered by bump-semver)
+    cli_toml="crates/stable-which-cli/Cargo.toml"
+    perl -i -pe "s/(stable-which\s*=\s*\{[^}]*version\s*=\s*\")\Q${current}\E(\")/\${1}${new_version}\${2}/" "${cli_toml}"
+    # Regenerate Cargo.lock
+    cargo check --quiet
+    bump-semver vcs commit \
+      -m "Release v$(bump-semver get Cargo.toml)" \
+      Cargo.toml crates/stable-which-cli/Cargo.toml Cargo.lock
+
+# push to origin/main with gates
+push: ci check-outdated-translations check-version-bumped
+    bump-semver vcs push --branch main --jj-bookmark-auto-advance
+    @echo "[hint] gh-monitor:watch-workflow --sha $(bump-semver vcs get commit-id --rev main) --on-success release.yml 'just on-success-release' kawaz/stable-which"
+
+# tap pull + brew upgrade after release.yml succeeds (triggered via watch-workflow --on-success)
+on-success-release:
+    # tap repo を直接 git pull (= `brew update` 全 tap 巡回より速い)
+    git -C "$(brew --repository)/Library/Taps/kawaz/homebrew-tap" pull --ff-only
+    brew upgrade kawaz/tap/stable-which
+    stable-which --version
+
+# ---------- utility ----------
+
+# format source (cargo fmt --all)
 fmt:
     cargo fmt --all
 
-# ビルドして実行
-run *ARGS: build
-    ./target/release/stable-which {{ARGS}}
-
-# [workspace.package] version を bump する (bump: major / minor / patch)
-# version 値を Cargo.toml に書き込み、CLI の path 依存 version も同期更新する。
-# commit/push はしない。tag は release.yml が打つ。
-bump bump="patch":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    current=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    IFS='.' read -r major minor patchv <<< "$current"
-    case "{{bump}}" in
-        major) major=$((major + 1)); minor=0; patchv=0 ;;
-        minor) minor=$((minor + 1)); patchv=0 ;;
-        patch) patchv=$((patchv + 1)) ;;
-        *) echo "Error: Invalid bump type '{{bump}}' (use major/minor/patch)" >&2; exit 1 ;;
-    esac
-    new_version="${major}.${minor}.${patchv}"
-    # BSD/GNU 両対応: perl -i で in-place 置換
-    perl -i -pe "s/^version = \"${current}\"/version = \"${new_version}\"/" Cargo.toml
-    # CLI の path 依存 version を同期更新 (stable-which = { path = "...", version = "..." } 行のみ)
-    cli_toml="crates/stable-which-cli/Cargo.toml"
-    perl -i -pe "s/(stable-which\s*=\s*\{[^}]*version\s*=\s*\")${current}(\")/${1}${new_version}${2}/" "${cli_toml}"
-    cargo check --quiet
-    echo "Version: ${current} -> ${new_version}"
-
-# main へ push する (push-guard hook の正規経路)
-push:
-    jj git push --bookmark main
-
-# リリース: bump → check → commit → push
-# tag は release.yml が自動で打つ。手動で tag を打たない。
-release bump="patch": (bump bump)
-    #!/usr/bin/env bash
-    set -euo pipefail
-    new_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-
-    # CI チェック
-    cargo fmt --check --all || { echo "Error: Run 'just fmt' first." >&2; exit 1; }
-    cargo clippy --workspace -- -D warnings
-    cargo test --workspace
-
-    # commit + push (jj 経由)
-    jj describe -m "Release v${new_version}"
-    jj new
-    jj bookmark set main -r @-
-    just push
-
-    echo "Pushed v${new_version} to main. release.yml will create the tag and GH Release."
+# display Cargo.toml version + binary --version output
+version:
+    echo "Cargo.toml: $(bump-semver get Cargo.toml)"
+    if [ -x ./target/release/stable-which ]; then echo "binary: $(./target/release/stable-which --version)"; fi
+    if command -v stable-which >/dev/null 2>&1; then echo "installed: $(stable-which --version)"; fi
