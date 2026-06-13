@@ -1,6 +1,7 @@
 use serde::Serialize;
-use stable_which::candidate::{
-    Candidate, PathTag, ScoringPolicy, find_candidates, resolve_stable_path,
+use stable_which::{
+    Candidate, Durability, PathTag, ScoringPolicy, find_candidates, rank_candidates,
+    resolve_stable_path,
 };
 use std::env;
 use std::path::Path;
@@ -16,16 +17,36 @@ struct CandidateJson {
     path: String,
     canonical: String,
     tags: Vec<serde_json::Value>,
-    score: i32,
+    durability: &'static str,
+    /// Rank index after sorting (0 = best). Replaces the former raw `score`
+    /// field; the absolute score value is no longer part of the public API.
+    rank: usize,
 }
 
 impl CandidateJson {
-    fn from_candidate(c: &Candidate, policy: ScoringPolicy) -> Self {
+    fn from_candidate(c: &Candidate, rank: usize) -> Self {
         CandidateJson {
-            path: c.path.display().to_string(),
-            canonical: c.canonical.display().to_string(),
-            tags: c.tags.iter().map(tag_to_json).collect(),
-            score: c.score(policy),
+            path: c.path().display().to_string(),
+            canonical: c.canonical().display().to_string(),
+            tags: c.tags().iter().map(tag_to_json).collect(),
+            durability: durability_str(c.durability()),
+            rank,
+        }
+    }
+}
+
+fn durability_str(d: Durability) -> &'static str {
+    match d {
+        Durability::Durable => "durable",
+        Durability::NotDurable => "not-durable",
+        Durability::Unknown => "unknown",
+        // `Durability` is #[non_exhaustive]; a future library variant we do not
+        // know about must be surfaced, not silently mapped to "unknown".
+        _ => {
+            eprintln!(
+                "{NAME}: warning: unrecognized Durability variant from the library; update {NAME}"
+            );
+            "unrecognized"
         }
     }
 }
@@ -47,18 +68,35 @@ fn tag_to_json(tag: &PathTag) -> serde_json::Value {
         PathTag::BuildOutput => serde_json::Value::String("build-output".into()),
         PathTag::Ephemeral => serde_json::Value::String("ephemeral".into()),
         PathTag::NotExecutable => serde_json::Value::String("not-executable".into()),
-        _ => serde_json::Value::String("unknown".into()),
+        // `PathTag` is #[non_exhaustive]; surface unknown future variants
+        // instead of silently emitting "unknown".
+        _ => {
+            eprintln!(
+                "{NAME}: warning: unrecognized PathTag variant from the library; update {NAME}"
+            );
+            serde_json::Value::String("unrecognized".into())
+        }
     }
 }
 
-fn warn_different_binary(candidate: Option<&Candidate>) {
-    if let Some(c) = candidate
-        && c.tags.contains(&PathTag::DifferentBinary)
-    {
+fn warn_best_candidate(candidate: Option<&Candidate>) {
+    let Some(c) = candidate else { return };
+    if c.tags().contains(&PathTag::DifferentBinary) {
         eprintln!(
             "{NAME}: warning: best candidate '{}' is a different binary from the input",
-            c.path.display()
+            c.path().display()
         );
+    }
+    match c.durability() {
+        Durability::NotDurable => eprintln!(
+            "{NAME}: warning: best candidate '{}' is not durable (versioned/ephemeral/build/project-local); it may break on upgrade or reboot",
+            c.path().display()
+        ),
+        Durability::Unknown => eprintln!(
+            "{NAME}: warning: durability of best candidate '{}' is unknown; treating as not safe to pin",
+            c.path().display()
+        ),
+        _ => {}
     }
 }
 
@@ -173,21 +211,22 @@ fn run() -> Result<(), String> {
     })?;
 
     if show_all {
-        let candidates =
-            find_candidates(Path::new(&binary_path), policy).map_err(|e| e.to_string())?;
+        let mut candidates = find_candidates(Path::new(&binary_path)).map_err(|e| e.to_string())?;
+        rank_candidates(&mut candidates, policy);
         if !quiet {
-            warn_different_binary(candidates.first());
+            warn_best_candidate(candidates.first());
         }
         match format {
             OutputFormat::Path => {
                 for c in &candidates {
-                    println!("{}", c.path.display());
+                    println!("{}", c.path().display());
                 }
             }
             OutputFormat::Json => {
                 let json_candidates: Vec<CandidateJson> = candidates
                     .iter()
-                    .map(|c| CandidateJson::from_candidate(c, policy))
+                    .enumerate()
+                    .map(|(rank, c)| CandidateJson::from_candidate(c, rank))
                     .collect();
                 let json = serde_json::to_string_pretty(&json_candidates)
                     .map_err(|e| format!("JSON serialization error: {e}"))?;
@@ -198,14 +237,15 @@ fn run() -> Result<(), String> {
         let best =
             resolve_stable_path(Path::new(&binary_path), policy).map_err(|e| e.to_string())?;
         if !quiet {
-            warn_different_binary(Some(&best));
+            warn_best_candidate(Some(&best));
         }
         match format {
             OutputFormat::Path => {
-                println!("{}", best.path.display());
+                println!("{}", best.path().display());
             }
             OutputFormat::Json => {
-                let json_value = CandidateJson::from_candidate(&best, policy);
+                // The single resolved candidate is the top-ranked one.
+                let json_value = CandidateJson::from_candidate(&best, 0);
                 let json = serde_json::to_string_pretty(&json_value)
                     .map_err(|e| format!("JSON serialization error: {e}"))?;
                 println!("{json}");

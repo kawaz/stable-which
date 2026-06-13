@@ -156,9 +156,10 @@ pub fn is_executable(path: &Path) -> bool {
         ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.PS1".to_string()
     });
     match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => pathext
-            .split(';')
-            .any(|pe| pe.strip_prefix('.').is_some_and(|pe| pe.eq_ignore_ascii_case(ext))),
+        Some(ext) => pathext.split(';').any(|pe| {
+            pe.strip_prefix('.')
+                .is_some_and(|pe| pe.eq_ignore_ascii_case(ext))
+        }),
         None => false,
     }
 }

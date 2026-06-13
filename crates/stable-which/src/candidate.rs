@@ -5,6 +5,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::durability::{self, Durability};
 use crate::path_analysis;
 
 #[derive(Debug)]
@@ -79,11 +80,19 @@ pub enum PathTag {
     NotExecutable,
 }
 
+/// A discovered location for a binary, with the observed [`PathTag`]s that
+/// describe it.
+///
+/// Fields are private; use the accessors ([`path`](Self::path),
+/// [`canonical`](Self::canonical), [`tags`](Self::tags),
+/// [`durability`](Self::durability), [`is_stable`](Self::is_stable)). This
+/// hides the internal `Vec<PathTag>` representation so it can change without
+/// breaking the public API.
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub path: PathBuf,
-    pub canonical: PathBuf,
-    pub tags: Vec<PathTag>,
+    path: PathBuf,
+    canonical: PathBuf,
+    tags: Vec<PathTag>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -95,7 +104,58 @@ pub enum ScoringPolicy {
 }
 
 impl Candidate {
-    pub fn score(&self, policy: ScoringPolicy) -> i32 {
+    /// The path of this candidate as discovered (input, PATH entry, symlink
+    /// target, etc.). Not necessarily canonicalized.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The canonical path of this candidate.
+    ///
+    /// When [`std::fs::canonicalize`] succeeds this is the real (symlink- and
+    /// `..`-resolved) path. When it fails, it falls back to the candidate's
+    /// own path, so this is **not guaranteed** to always be a realpath.
+    pub fn canonical(&self) -> &Path {
+        &self.canonical
+    }
+
+    /// The observed tags describing this candidate.
+    ///
+    /// Tag order is **not guaranteed** ([`PathTag::Input`] /
+    /// [`PathTag::InPathEnv`] happen to lead, but other tags follow in
+    /// implementation order). Test membership with
+    /// `tags().contains(...)` / `tags().iter().any(...)`, not by position.
+    pub fn tags(&self) -> &[PathTag] {
+        &self.tags
+    }
+
+    /// The [`Durability`] of this candidate's [`path`](Self::path): whether the
+    /// path string can be pinned into a service definition and survive
+    /// rebuild / upgrade / reboot.
+    ///
+    /// Judged per candidate, so the reference path and the canonical path of
+    /// the same binary can differ (e.g. `/opt/homebrew/bin/git` is
+    /// [`Durable`](Durability::Durable) while
+    /// `/opt/homebrew/Cellar/git/2.44.0/bin/git` is
+    /// [`NotDurable`](Durability::NotDurable)). See [`Durability`] for the
+    /// judging model and its known limitations.
+    pub fn durability(&self) -> Durability {
+        durability::judge(&self.path)
+    }
+
+    /// Whether this candidate is *durable-to-pin*: `true` iff
+    /// [`durability`](Self::durability) is [`Durability::Durable`].
+    ///
+    /// [`Durability::Unknown`] is treated as not stable (safe side).
+    pub fn is_stable(&self) -> bool {
+        matches!(self.durability(), Durability::Durable)
+    }
+
+    /// Ranking score for a [`ScoringPolicy`]. Internal: the absolute value is
+    /// policy-dependent and not a stable ordering across policies, so it is not
+    /// part of the public API. Public ranking is expressed by
+    /// [`rank_candidates`].
+    pub(crate) fn score(&self, policy: ScoringPolicy) -> i32 {
         let binary_score = if self.tags.contains(&PathTag::SameCanonical) {
             3
         } else if self.tags.contains(&PathTag::SameContent) {
@@ -109,7 +169,14 @@ impl Candidate {
         let has_managed = self.tags.iter().any(|t| matches!(t, PathTag::ManagedBy(_)));
         let has_shim = self.tags.contains(&PathTag::Shim);
 
-        let stability_score = if has_build_output || has_ephemeral {
+        // Preference tier within a score band: this is *not* durability
+        // (DR-016). It expresses how preferred a candidate is among same-band
+        // peers, distinct from "can this path be baked in" (`durability()`).
+        //
+        // Tiers are 0 / 1 / 3; tier 2 is intentionally left as a gap reserved
+        // for a future intermediate category, so existing tiers keep their
+        // relative spacing without a re-numbering churn.
+        let preference_tier = if has_build_output || has_ephemeral {
             0
         } else if has_managed || has_shim {
             1
@@ -136,16 +203,18 @@ impl Candidate {
 
         match policy {
             ScoringPolicy::SameBinary => {
-                binary_score * 1000 + stability_score * 10 + in_path_bonus + penalty
+                binary_score * 1000 + preference_tier * 10 + in_path_bonus + penalty
             }
             ScoringPolicy::Stable => {
-                stability_score * 1000 + binary_score * 10 + in_path_bonus + penalty
+                preference_tier * 1000 + binary_score * 10 + in_path_bonus + penalty
             }
         }
     }
 
-    /// PATH discovery order from InPathEnv tag, or usize::MAX if not from PATH
-    pub fn path_order(&self) -> usize {
+    /// PATH discovery order from the [`PathTag::InPathEnv`] tag, or
+    /// [`usize::MAX`] if this candidate did not come from PATH. Internal: used
+    /// for deterministic tie-breaking in [`rank_candidates`].
+    pub(crate) fn path_order(&self) -> usize {
         self.tags
             .iter()
             .find_map(|t| match t {
@@ -153,6 +222,23 @@ impl Candidate {
                 _ => None,
             })
             .unwrap_or(usize::MAX)
+    }
+
+    /// Construct a candidate from its parts. Internal only.
+    fn new(path: PathBuf, canonical: PathBuf, tags: Vec<PathTag>) -> Self {
+        Candidate {
+            path,
+            canonical,
+            tags,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Candidate {
+    /// Test-only constructor for building candidates from tags directly.
+    pub(crate) fn for_test(path: PathBuf, canonical: PathBuf, tags: Vec<PathTag>) -> Self {
+        Candidate::new(path, canonical, tags)
     }
 }
 
@@ -278,10 +364,33 @@ fn tag_path(path: &Path, input_canonical: &Path, input_path: &Path) -> (Vec<Path
     (tags, canonical)
 }
 
-pub fn find_candidates_with_env(
+/// Discover all candidate locations for `binary`, using `path_env` as the PATH
+/// to search.
+///
+/// This is *discovery only*: candidates are returned in deterministic order
+/// (input-derived variants first, then PATH matches in discovery order). Use
+/// [`rank_candidates`] to order them by a [`ScoringPolicy`].
+///
+/// On success the returned `Vec` is **never empty**: the input itself is always
+/// emitted as a candidate. An empty result is impossible — failures surface as
+/// [`Err`] ([`Error::NotFound`] / [`Error::NotAFile`] / [`Error::NotInPath`]
+/// etc.) instead.
+///
+/// # `path_env`
+///
+/// `path_env` is the PATH-equivalent search list, not a full environment.
+///
+/// - `None` does **not** mean "skip PATH search". If `binary` is a bare command
+///   name (no path separator) and `path_env` is `None`, resolution fails with
+///   [`Error::NotInPath`]. If `binary` is an explicit path, input-derived
+///   candidates are still returned with `None`.
+/// - On Windows, `PATHEXT` is **not** taken from this argument; it is read
+///   directly from the process environment via [`std::env::var`]. See the
+///   Design rationale in the source. Full env injection (PATHEXT as an
+///   argument) is intentionally deferred (YAGNI).
+pub fn find_candidates_with_path_env(
     binary: &Path,
     path_env: Option<OsString>,
-    policy: ScoringPolicy,
 ) -> Result<Vec<Candidate>, Error> {
     // Command name resolution: if no path separator, look up in PATH
     let resolved_binary;
@@ -300,7 +409,12 @@ pub fn find_candidates_with_env(
                     if path_analysis::is_executable(&exact) {
                         return Some(exact);
                     }
-                    // On Windows, also try with PATHEXT extensions
+                    // On Windows, also try with PATHEXT extensions.
+                    // Design rationale: PATHEXT is read directly from the
+                    // process environment rather than passed as an argument.
+                    // `find_candidates_with_path_env` only injects PATH; full
+                    // env injection (PATHEXT as a parameter) is deferred as
+                    // YAGNI (DR-015 Decision 7).
                     #[cfg(windows)]
                     {
                         let pathext = std::env::var("PATHEXT")
@@ -352,11 +466,7 @@ pub fn find_candidates_with_env(
         let (mut tags, canonical) = tag_path(binary, &input_canonical, binary);
         tags.insert(0, PathTag::Input);
         seen_paths.insert(normalize_for_dedup(binary));
-        candidates.push(Candidate {
-            path: binary.to_path_buf(),
-            canonical,
-            tags,
-        });
+        candidates.push(Candidate::new(binary.to_path_buf(), canonical, tags));
     }
 
     // 2. ./ or .\ prefixed (bare relative path -> explicit relative path, if file exists)
@@ -374,11 +484,7 @@ pub fn find_candidates_with_env(
             if dot_prefixed.exists() && !seen_paths.contains(&dedup_key) {
                 seen_paths.insert(dedup_key);
                 let (tags, canonical) = tag_path(&dot_prefixed, &input_canonical, binary);
-                candidates.push(Candidate {
-                    path: dot_prefixed,
-                    canonical,
-                    tags,
-                });
+                candidates.push(Candidate::new(dot_prefixed, canonical, tags));
             }
         }
     }
@@ -392,11 +498,7 @@ pub fn find_candidates_with_env(
         if !seen_paths.contains(&dedup_key) {
             seen_paths.insert(dedup_key);
             let (tags, canonical) = tag_path(&absolute, &input_canonical, binary);
-            candidates.push(Candidate {
-                path: absolute,
-                canonical,
-                tags,
-            });
+            candidates.push(Candidate::new(absolute, canonical, tags));
         }
     }
 
@@ -406,21 +508,23 @@ pub fn find_candidates_with_env(
         if !seen_paths.contains(&dedup_key) {
             seen_paths.insert(dedup_key);
             let (tags, canonical) = tag_path(&input_canonical, &input_canonical, binary);
-            candidates.push(Candidate {
-                path: input_canonical.clone(),
-                canonical,
-                tags,
-            });
+            candidates.push(Candidate::new(input_canonical.clone(), canonical, tags));
         }
     }
 
     // 5. Symlink target (one level of resolution, if input is a symlink)
     if let Ok(link_target) = fs::read_link(binary) {
         let link_target = if link_target.is_relative() {
-            binary
+            // Join against the symlink's directory, then normalize away `.`/`..`
+            // (without touching symlinks) so the result is consistent with the
+            // absolutized candidate path (variant 3) and dedups correctly. A
+            // raw join can leave `..` components that would otherwise add a
+            // spurious NonNormalized tag and miss dedup.
+            let joined = binary
                 .parent()
                 .map(|p| p.join(&link_target))
-                .unwrap_or(link_target)
+                .unwrap_or(link_target);
+            normalize_path(&joined)
         } else {
             link_target
         };
@@ -428,11 +532,7 @@ pub fn find_candidates_with_env(
         if !seen_paths.contains(&dedup_key) {
             seen_paths.insert(dedup_key);
             let (tags, canonical) = tag_path(&link_target, &input_canonical, binary);
-            candidates.push(Candidate {
-                path: link_target,
-                canonical,
-                tags,
-            });
+            candidates.push(Candidate::new(link_target, canonical, tags));
         }
     }
 
@@ -445,12 +545,11 @@ pub fn find_candidates_with_env(
             // On Windows, also try PATHEXT extensions
             #[cfg(windows)]
             {
-                let pathext = std::env::var("PATHEXT")
-                    .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+                let pathext =
+                    std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
                 let name_str = file_name.to_string_lossy();
                 for ext in pathext.split(';') {
-                    candidates_in_dir
-                        .push(dir.join(format!("{}{}", name_str, ext.to_lowercase())));
+                    candidates_in_dir.push(dir.join(format!("{}{}", name_str, ext.to_lowercase())));
                 }
             }
 
@@ -465,44 +564,58 @@ pub fn find_candidates_with_env(
                 if !seen_paths.insert(normalize_for_dedup(&candidate_path)) {
                     continue;
                 }
-                let (mut tags, canonical) =
-                    tag_path(&candidate_path, &input_canonical, binary);
+                let (mut tags, canonical) = tag_path(&candidate_path, &input_canonical, binary);
                 tags.insert(0, PathTag::InPathEnv(path_order));
-                candidates.push(Candidate {
-                    path: candidate_path,
-                    canonical,
-                    tags,
-                });
+                candidates.push(Candidate::new(candidate_path, canonical, tags));
                 path_order += 1;
             }
         }
     }
 
-    // Sort by score descending, then by PATH discovery order ascending (deterministic tie-breaking)
+    Ok(candidates)
+}
+
+/// Discover all candidate locations for `binary`, searching the process `PATH`.
+///
+/// This is *discovery only* and returns candidates in deterministic
+/// (PATH discovery) order. Use [`rank_candidates`] to order them by a
+/// [`ScoringPolicy`]. A thin wrapper over [`find_candidates_with_path_env`]
+/// that reads `PATH` from the process environment.
+///
+/// On success the returned `Vec` is **never empty** (see
+/// [`find_candidates_with_path_env`]).
+pub fn find_candidates(binary: &Path) -> Result<Vec<Candidate>, Error> {
+    find_candidates_with_path_env(binary, env::var_os("PATH"))
+}
+
+/// Sort `candidates` in place by score descending, with PATH discovery order
+/// ascending as a deterministic tie-breaker.
+///
+/// `score` is policy-dependent and internal; ranking is expressed solely
+/// through this ordering. Takes `&mut [Candidate]` (Rust slice-sort idiom) so
+/// the caller keeps ownership of its `Vec`.
+pub fn rank_candidates(candidates: &mut [Candidate], policy: ScoringPolicy) {
     candidates.sort_by(|a, b| {
         let score_cmp = b.score(policy).cmp(&a.score(policy));
         score_cmp.then(a.path_order().cmp(&b.path_order()))
     });
-
-    Ok(candidates)
 }
 
-pub fn find_candidates(binary: &Path, policy: ScoringPolicy) -> Result<Vec<Candidate>, Error> {
-    find_candidates_with_env(binary, env::var_os("PATH"), policy)
-}
-
+/// Resolve the single best candidate for `binary` under `policy`.
+///
+/// Convenience composition of [`find_candidates`] + [`rank_candidates`]:
+/// returns the top-ranked candidate. Because `find_candidates` is non-empty on
+/// success, this always returns a tagged candidate when it returns [`Ok`]
+/// (never a fabricated tagless one).
 pub fn resolve_stable_path(binary: &Path, policy: ScoringPolicy) -> Result<Candidate, Error> {
-    let candidates = find_candidates(binary, policy)?;
-    if let Some(first) = candidates.into_iter().next() {
-        Ok(first)
-    } else {
-        let canonical = fs::canonicalize(binary).unwrap_or_else(|_| binary.to_path_buf());
-        Ok(Candidate {
-            path: canonical.clone(),
-            canonical,
-            tags: vec![],
-        })
-    }
+    let mut candidates = find_candidates(binary)?;
+    rank_candidates(&mut candidates, policy);
+    // `find_candidates` guarantees a non-empty Vec on success (the input is
+    // always emitted), so the first element exists.
+    Ok(candidates
+        .into_iter()
+        .next()
+        .expect("find_candidates returns a non-empty Vec on success"))
 }
 
 #[cfg(test)]
@@ -514,11 +627,7 @@ mod tests {
     // --- score() tests ---
 
     fn make_candidate(tags: Vec<PathTag>) -> Candidate {
-        Candidate {
-            path: PathBuf::from("/dummy"),
-            canonical: PathBuf::from("/dummy"),
-            tags,
-        }
+        Candidate::for_test(PathBuf::from("/dummy"), PathBuf::from("/dummy"), tags)
     }
 
     #[test]
@@ -672,7 +781,7 @@ mod tests {
         assert_eq!(score, 3030);
     }
 
-    // --- find_candidates_with_env tests ---
+    // --- find_candidates_with_path_env tests ---
 
     #[cfg(unix)]
     struct TestFixture {
@@ -730,9 +839,7 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         // Should have at least 2 candidates: input (+ derived) + symlink from PATH
         assert!(candidates.len() >= 2);
@@ -760,9 +867,7 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.other_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let other_cand = candidates
             .iter()
@@ -779,9 +884,7 @@ mod tests {
         fs::create_dir_all(&empty_dir).unwrap();
         let path_env = f.make_path(&[&empty_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         // At least the input candidate (+ possibly canonical variant)
         assert!(!candidates.is_empty());
@@ -794,9 +897,7 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let input_cand = candidates.iter().find(|c| c.path == f.real_binary).unwrap();
         assert!(input_cand.tags.contains(&PathTag::Input));
@@ -808,9 +909,7 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let path_cand = candidates.iter().find(|c| c.path == f.stable_link).unwrap();
         assert!(
@@ -835,9 +934,7 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let symlink_cand = candidates.iter().find(|c| c.path == f.stable_link).unwrap();
         let has_symlink_tag = symlink_cand
@@ -867,8 +964,7 @@ mod tests {
         fs::set_permissions(&binary_b, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path_env = env::join_paths([&dir_b]).unwrap();
-        let candidates =
-            find_candidates_with_env(&binary_a, Some(path_env), ScoringPolicy::SameBinary).unwrap();
+        let candidates = find_candidates_with_path_env(&binary_a, Some(path_env)).unwrap();
 
         let copy_cand = candidates.iter().find(|c| c.path == binary_b).unwrap();
         assert!(copy_cand.tags.contains(&PathTag::SameContent));
@@ -878,16 +974,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_sorted_by_score_descending() {
+    fn test_rank_candidates_sorts_by_score_descending() {
         let f = TestFixture::new();
         // stable_dir has symlink (SameCanonical), other_dir has different binary
         let path_env = f.make_path(&[&f.other_dir, &f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        // find_candidates_with_path_env is discovery-only (unsorted); ranking
+        // is a separate step.
+        let mut candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
+        rank_candidates(&mut candidates, ScoringPolicy::SameBinary);
 
-        // Verify scores are in descending order
+        // Verify scores are in descending order after ranking
         let scores: Vec<i32> = candidates
             .iter()
             .map(|c| c.score(ScoringPolicy::SameBinary))
@@ -899,11 +996,7 @@ mod tests {
 
     #[test]
     fn test_nonexistent_binary_error() {
-        let result = find_candidates_with_env(
-            Path::new("/nonexistent/binary"),
-            None,
-            ScoringPolicy::SameBinary,
-        );
+        let result = find_candidates_with_path_env(Path::new("/nonexistent/binary"), None);
         assert!(result.is_err());
     }
 
@@ -915,9 +1008,7 @@ mod tests {
         let real_dir = f.real_binary.parent().unwrap();
         let path_env = f.make_path(&[real_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let count = candidates
             .iter()
@@ -933,9 +1024,7 @@ mod tests {
         // Same directory appears twice in PATH
         let path_env = f.make_path(&[&f.stable_dir, &f.stable_dir]);
 
-        let candidates =
-            find_candidates_with_env(&f.real_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
 
         let stable_count = candidates
             .iter()
@@ -953,12 +1042,8 @@ mod tests {
         let f = TestFixture::new();
         let path_env = f.make_path(&[&f.stable_dir]);
 
-        let candidates = find_candidates_with_env(
-            Path::new("mybinary"),
-            Some(path_env),
-            ScoringPolicy::SameBinary,
-        )
-        .unwrap();
+        let candidates =
+            find_candidates_with_path_env(Path::new("mybinary"), Some(path_env)).unwrap();
 
         assert!(!candidates.is_empty());
         assert!(candidates[0].tags.contains(&PathTag::Input));
@@ -971,11 +1056,7 @@ mod tests {
         fs::create_dir_all(&empty_dir).unwrap();
         let path_env = env::join_paths([&empty_dir]).unwrap();
 
-        let result = find_candidates_with_env(
-            Path::new("nonexistent"),
-            Some(path_env),
-            ScoringPolicy::SameBinary,
-        );
+        let result = find_candidates_with_path_env(Path::new("nonexistent"), Some(path_env));
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::NotInPath(_)));
     }
@@ -1009,9 +1090,7 @@ mod tests {
         fs::set_permissions(&other_binary, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path_env = env::join_paths([&shim_dir, &other_dir]).unwrap();
-        let candidates =
-            find_candidates_with_env(&other_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&other_binary, Some(path_env)).unwrap();
 
         let shim_cand = candidates.iter().find(|c| c.path == shim_binary).unwrap();
         assert!(shim_cand.tags.contains(&PathTag::Shim));
@@ -1045,9 +1124,7 @@ mod tests {
         fs::set_permissions(&input_binary, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path_env = env::join_paths([&shim_dir]).unwrap();
-        let candidates =
-            find_candidates_with_env(&input_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&input_binary, Some(path_env)).unwrap();
 
         let shim_cand = candidates.iter().find(|c| c.path == shim_link).unwrap();
         assert!(shim_cand.tags.contains(&PathTag::Shim));
@@ -1079,11 +1156,89 @@ mod tests {
         fs::set_permissions(&input_binary, fs::Permissions::from_mode(0o755)).unwrap();
 
         let path_env = env::join_paths([&link_dir]).unwrap();
-        let candidates =
-            find_candidates_with_env(&input_binary, Some(path_env), ScoringPolicy::SameBinary)
-                .unwrap();
+        let candidates = find_candidates_with_path_env(&input_binary, Some(path_env)).unwrap();
 
         let link_cand = candidates.iter().find(|c| c.path == link).unwrap();
         assert!(!link_cand.tags.contains(&PathTag::Shim));
+    }
+
+    // --- accessors / durability / 3-layer API ---
+
+    #[test]
+    fn test_durability_accessor_per_candidate() {
+        // Reference surface is durable; versioned canonical is not.
+        let durable = Candidate::for_test(
+            PathBuf::from("/opt/homebrew/bin/git"),
+            PathBuf::from("/opt/homebrew/Cellar/git/2.44.0/bin/git"),
+            vec![PathTag::Input],
+        );
+        assert_eq!(durable.durability(), Durability::Durable);
+        assert!(durable.is_stable());
+
+        let versioned = Candidate::for_test(
+            PathBuf::from("/opt/homebrew/Cellar/git/2.44.0/bin/git"),
+            PathBuf::from("/opt/homebrew/Cellar/git/2.44.0/bin/git"),
+            vec![PathTag::SameCanonical],
+        );
+        assert_eq!(versioned.durability(), Durability::NotDurable);
+        assert!(!versioned.is_stable());
+    }
+
+    #[test]
+    fn test_is_stable_false_for_unknown() {
+        let c = Candidate::for_test(
+            PathBuf::from("/home/u/.local/bin/jupyter"),
+            PathBuf::from("/home/u/.local/bin/jupyter"),
+            vec![PathTag::Input],
+        );
+        assert_eq!(c.durability(), Durability::Unknown);
+        assert!(!c.is_stable());
+    }
+
+    #[test]
+    fn test_accessors_return_internal_fields() {
+        let c = Candidate::for_test(
+            PathBuf::from("/a/b"),
+            PathBuf::from("/c/d"),
+            vec![PathTag::Input, PathTag::SameCanonical],
+        );
+        assert_eq!(c.path(), Path::new("/a/b"));
+        assert_eq!(c.canonical(), Path::new("/c/d"));
+        assert_eq!(c.tags(), &[PathTag::Input, PathTag::SameCanonical]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_candidates_with_path_env_is_unsorted_discovery() {
+        // Discovery order is input-derived first, then PATH order. Not sorted
+        // by score. The input candidate stays at index 0.
+        let f = TestFixture::new();
+        let path_env = f.make_path(&[&f.other_dir, &f.stable_dir]);
+        let candidates = find_candidates_with_path_env(&f.real_binary, Some(path_env)).unwrap();
+        assert!(candidates[0].tags().contains(&PathTag::Input));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_candidates_non_empty_on_success() {
+        let f = TestFixture::new();
+        // Explicit path with empty PATH search: still returns the input.
+        let candidates = find_candidates_with_path_env(&f.real_binary, None).unwrap();
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.tags().contains(&PathTag::Input))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_stable_path_returns_tagged_candidate() {
+        let f = TestFixture::new();
+        // resolve_stable_path uses the process PATH; the input is an explicit
+        // path so a tagged candidate is always returned.
+        let best = resolve_stable_path(&f.real_binary, ScoringPolicy::SameBinary).unwrap();
+        assert!(!best.tags().is_empty());
     }
 }

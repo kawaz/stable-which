@@ -23,26 +23,50 @@ stable-which はバイナリパスの安定性を評価し、PATH 上の全候�
 
 ### Candidate
 
+フィールドは private（DR-015 Decision 1）。アクセサ経由で参照する:
+
 ```
-path: PathBuf       -- エントリパス（タグ評価対象）
-canonical: PathBuf  -- realpath（symlink 全解決済み）
-tags: Vec<PathTag>  -- 付与されたタグ
+path() -> &Path           -- エントリパス（タグ・durability 評価対象、canonical とは限らない）
+canonical() -> &Path       -- canonicalize 成功時は realpath、失敗時は入力パスにフォールバック
+tags() -> &[PathTag]       -- 付与されたタグ（順序非保証）
+durability() -> Durability -- 焼き込み耐久性（下記）
+is_stable() -> bool        -- matches!(durability(), Durable) の convenience
 ```
 
-`path_order()` メソッドで `InPathEnv` の発見順を取得。Input 候補は `usize::MAX`（tie-break で最低優先）。
+内部 `path_order()`（`pub(crate)`）で `InPathEnv` の発見順を取得。Input 候補は `usize::MAX`（tie-break で最低優先）。テスト用に `Candidate::for_test(..)`（`#[cfg(test)]`）。
+
+### Durability（DR-016）
+
+`PathTag` とは直交する別軸 enum。「そのパスを launchd plist / systemd unit に焼き込んで rebuild / upgrade / reboot を跨いで生き続けるか（durable-to-pin）」を表す。`#[non_exhaustive]`。
+
+| variant | 意味 |
+|---|---|
+| Durable | 環境全体の参照面（system bin / profile bin / 標準 shim 等）。焼き込んでよい |
+| NotDurable | versioned-install / ephemeral / build-output / project-local。焼き込むと壊れうる |
+| Unknown | 既知パターン非該当（user dropbox `~/bin`・`~/.local/bin` 等）。安全側 = not-durable 扱い |
+
+判定は allow-list 方式・候補ごと（DR-016 Decision 3/4）:
+
+1. NotDurable 先行: versioned-install | ephemeral | build-output | project-local
+2. durable location（厳格マッチ）: 直下ディレクトリ完全一致（`/usr/bin`, `/usr/local/bin`, `/opt/homebrew/bin` 等）/ `/etc/profiles/per-user/<user>/bin/<file>` の構造一致 / HOME アンカーされた標準 shim（`~/.local/share/mise/shims/` 等）
+3. それ以外 → Unknown
+
+部分一致（`contains`）は使わず構造で照合する（`/usr/local/binutils` や project-local な `/repo/.mise/shims/` の誤判定を防ぐ）。Scope（project-local）は内部のみ、公開しない。
 
 ### ScoringPolicy
 
 | ポリシー | 重み | ユースケース |
 |---|---|---|
-| SameBinary（デフォルト） | binary × 1000 + stability × 10 + bonus + penalty | サービス登録（同一バイナリ重視） |
-| Stable | stability × 1000 + binary × 10 + bonus + penalty | 設定ファイル（パス安定度重視） |
+| SameBinary（デフォルト） | binary × 1000 + preference_tier × 10 + bonus + penalty | サービス登録（同一バイナリ重視） |
+| Stable | preference_tier × 1000 + binary × 10 + bonus + penalty | 設定ファイル（パス安定度重視） |
 
 スコア要素:
 - binary_score: SameCanonical=3, SameContent=2, DifferentBinary=0
-- stability_score: クリーン=3, ManagedBy/Shim=1, BuildOutput/Ephemeral=0
+- preference_tier: クリーン=3, ManagedBy/Shim=1, BuildOutput/Ephemeral=0（tier 2 は将来用に予約）
 - in_path_bonus: InPathEnv=+5
 - penalty: Relative=-3, NonNormalized=-2（累積）
+
+`preference_tier` は durability（DR-016）とは別概念（同スコア帯内の選好ティア）。`score()` は `pub(crate)`（公開しない）。ランキングは `rank_candidates` のソート結果として一意に表現する。
 
 ソート: スコア降順 → 同スコアは `path_order()` 昇順（PATH 先頭が優先）。
 
@@ -50,18 +74,21 @@ tags: Vec<PathTag>  -- 付与されたタグ
 
 `#[non_exhaustive]` enum。バリアント: NotFound, NotAFile, NoFileName, NotInPath, Canonicalize, Metadata。`impl Display` + `impl std::error::Error`。
 
-## API
+## API（find / rank / resolve の 3 層分離、DR-015 Decision 2）
 
 ```rust
-find_candidates(binary, policy) -> Result<Vec<Candidate>, Error>
-find_candidates_with_env(binary, path_env, policy) -> Result<Vec<Candidate>, Error>
+// 探索のみ（policy なし、PATH 発見順で決定的）
+find_candidates(binary) -> Result<Vec<Candidate>, Error>
+find_candidates_with_path_env(binary, path_env) -> Result<Vec<Candidate>, Error>
+// 順位付け（in-place ソート）
+rank_candidates(candidates: &mut [Candidate], policy)
+// 解決（find + rank の合成、最良候補を返す）
 resolve_stable_path(binary, policy) -> Result<Candidate, Error>
-detect_version_manager(path) -> Option<VersionManagerInfo>
-files_have_same_content(path_a, path_b) -> bool
-is_executable(path) -> bool
 ```
 
-ルート re-export あり: `stable_which::find_candidates` で直接利用可能。
+`find_candidates*` は成功時に必ず非空（入力候補を常に 1 件は返す）。候補ゼロは `Err` のみ。
+
+公開型: `Candidate`, `PathTag`, `ScoringPolicy`, `Durability`, `Error` をクレートルートから re-export（`stable_which::Candidate` 等）。`candidate` / `durability` / `path_analysis` モジュール、および `detect_version_manager` / `VersionManagerInfo` / `is_executable` / `files_have_same_content` 等の内部ヘルパーは非公開（DR-015 Decision 5/6）。
 
 ## CLI
 
@@ -107,9 +134,10 @@ PATH 候補は Unix 実行ビット (`mode & 0o111`) をチェック。入力バ
 
 ## 設計原則
 
-- 安定性は不安定パターンの不在で判定（ホワイトリストではない）
-- タグは candidate.path に対して評価（canonical ではない）
-- タグは客観的属性、スコアは主観的重み付け（分離）
+- durability（焼き込み耐久性）は allow-list 方式で判定（NotDurable 先行 → durable allow-list → Unknown）。判定不能は安全側 Unknown に倒す（DR-016）
+- preference_tier（スコア内の選好）は不安定パターンの不在で算出。durability とは別軸
+- タグ・durability は candidate.path() に対して評価（canonical ではない）。durability は候補ごと
+- タグは客観的属性、スコアは主観的重み付け（分離）。スコア絶対値は非公開、順位は rank_candidates で表現
 - ライブラリは依存ゼロ（Serialize 等は CLI 側）
 - 同スコアの候補は PATH 発見順で決定的に tie-break
 

@@ -28,8 +28,9 @@ After `brew upgrade`, the Cellar path breaks. When mise switches versions, the i
 1. Canonicalize the input binary path
 2. Search PATH for all same-name binaries
 3. Tag each candidate (SameCanonical, InPathEnv, ManagedBy, BuildOutput, Ephemeral, etc.)
-4. Score candidates based on the selected policy
-5. Return the best candidate (or all candidates with `--all`)
+4. Judge each candidate's **durability** (whether the path can be pinned into a service definition; see below)
+5. Rank candidates by the selected policy
+6. Return the best candidate (or all candidates with `--all`)
 
 ## Usage
 
@@ -56,15 +57,34 @@ stable-which --policy stable ./target/release/myapp
 
 ### Library
 
+Add the dependency:
+
+```bash
+cargo add stable-which
+```
+
 ```rust
-use stable_which::{find_candidates, ScoringPolicy};
+// Keep this example in sync with the crate-root doc example in
+// crates/stable-which/src/lib.rs (the canonical, doctest-verified version).
+use stable_which::{find_candidates, rank_candidates, Durability, ScoringPolicy};
 use std::path::Path;
 
-let candidates = find_candidates(Path::new("jj"), ScoringPolicy::SameBinary)?;
+// 1. Discover candidates (discovery only, deterministic PATH order)
+let mut candidates = find_candidates(Path::new("jj"))?;
+// 2. Rank them in place by a scoring policy
+rank_candidates(&mut candidates, ScoringPolicy::SameBinary);
+// 3. Inspect via accessors (fields are private)
 for c in &candidates {
-    println!("{}: {:?}", c.path.display(), c.tags);
+    println!("{}: {:?} durable={}", c.path().display(), c.tags(), c.is_stable());
+}
+let best = &candidates[0];
+if best.durability() == Durability::Durable {
+    println!("safe to pin: {}", best.path().display());
 }
 ```
+
+`resolve_stable_path(binary, policy)` is a convenience that composes
+`find_candidates` + `rank_candidates` and returns the single best candidate.
 
 ## CLI Options
 
@@ -99,6 +119,23 @@ Tags describe properties of each candidate path:
 **Warning (orange):** ManagedBy, Shim, BuildOutput, Ephemeral, Relative, NonNormalized
 
 **Negative (red):** DifferentBinary
+
+## Durability
+
+Each candidate is also judged on an orthogonal **durability** axis (`durable` /
+`not-durable` / `unknown`), exposed as `Candidate::durability()` and the
+`is_stable()` convenience (`true` only for `durable`). This answers "can this
+path be baked into a launchd plist / systemd unit and survive upgrade and
+reboot?":
+
+- **durable**: environment-wide reference surfaces (`/usr/bin`, `/opt/homebrew/bin`, profile bins, standard shim dirs)
+- **not-durable**: versioned installs (`Cellar/`, `nix/store/`, `installs/`), ephemeral / build-output / project-local paths
+- **unknown**: unrecognized locations and user dropboxes (`~/bin`, `~/.local/bin`) — treated as not safe to pin (safe side)
+
+Durability is judged per candidate, so the reference path `/opt/homebrew/bin/git`
+is `durable` while its canonical realpath `/opt/homebrew/Cellar/git/2.44.0/bin/git`
+is `not-durable`. The JSON output (`--inspect`) includes a `durability` field per
+candidate.
 
 ## Install
 

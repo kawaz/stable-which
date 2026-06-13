@@ -5,7 +5,7 @@
 - `--format <path|json>`: 出力形式（デフォルト: path）
 - `--all`: 全候補表示（デフォルト: 最良候補のみ）
 - `--policy <same-binary|stable>`: スコアリングポリシー
-- `-v, --verbose`: `--all --format json` のショートハンド
+- `-v, --verbose`: `--all --format json` のショートハンド（DR-012 で `--inspect` にリネーム、`-v` 廃止）
 
 ## 理由
 
