@@ -509,15 +509,15 @@ pub fn find_candidates_with_path_env(
     }
 
     // 3. Absolutized (relative -> absolute, without resolving symlinks)
-    if !binary.is_absolute()
-        && let Ok(cwd) = env::current_dir()
-    {
-        let absolute = normalize_path(&cwd.join(binary));
-        let dedup_key = normalize_for_dedup(&absolute);
-        if !seen_paths.contains(&dedup_key) {
-            seen_paths.insert(dedup_key);
-            let (tags, canonical) = tag_path(&absolute, &input_canonical, binary);
-            candidates.push(Candidate::new(absolute, canonical, tags));
+    if !binary.is_absolute() {
+        if let Ok(cwd) = env::current_dir() {
+            let absolute = normalize_path(&cwd.join(binary));
+            let dedup_key = normalize_for_dedup(&absolute);
+            if !seen_paths.contains(&dedup_key) {
+                seen_paths.insert(dedup_key);
+                let (tags, canonical) = tag_path(&absolute, &input_canonical, binary);
+                candidates.push(Candidate::new(absolute, canonical, tags));
+            }
         }
     }
 

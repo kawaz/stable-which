@@ -77,21 +77,16 @@ check-outdated-translations: ensure-clean
 
 # ---------- release flow ----------
 
-# bump Cargo.toml version (default: patch), sync CLI path-dep, and create a release commit
+# bump Cargo.toml version (default: patch) and create a release commit
 bump-version level="patch": ensure-clean
     #!/usr/bin/env bash
     set -euo pipefail
-    current=$(bump-semver get Cargo.toml)
     bump-semver "$1" Cargo.toml --write --quiet
-    new_version=$(bump-semver get Cargo.toml)
-    # Sync the path-dep version in the CLI crate (not covered by bump-semver)
-    cli_toml="crates/stable-which-cli/Cargo.toml"
-    perl -i -pe "s/(stable-which\s*=\s*\{[^}]*version\s*=\s*\")\Q${current}\E(\")/\${1}${new_version}\${2}/" "${cli_toml}"
-    # Regenerate Cargo.lock
+    # Regenerate Cargo.lock (the CLI path-dep carries no version to sync)
     cargo check --quiet
     bump-semver vcs commit \
       -m "Release v$(bump-semver get Cargo.toml)" \
-      Cargo.toml crates/stable-which-cli/Cargo.toml Cargo.lock
+      Cargo.toml Cargo.lock
 
 # push to origin/main with gates
 push: ci check-outdated-translations check-version-bumped

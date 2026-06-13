@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-06-13
+
+### Fixed
+
+- **MSRV**: replace a let-chain (`&& let`) with a nested `if let` so the crate
+  truly builds on the declared `rust-version = "1.85"`. 0.4.0 used a let-chain
+  that requires Rust 1.88, so `cargo build` failed on Rust 1.85–1.87; 0.4.0 is
+  yanked for this reason.
+
+### Changed
+
+- Drop the unused `version` field from the CLI crate's path dependency on
+  `stable-which` (`publish = false`); the release task no longer perl-syncs it.
+
 ## [0.4.0] — 2026-06-13
 
 This is a **breaking** release that stabilizes the public API toward 1.0. See
