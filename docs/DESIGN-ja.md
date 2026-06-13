@@ -1,4 +1,6 @@
-# Architecture
+# Design
+
+> [English](./DESIGN.md) | 日本語
 
 stable-which はバイナリパスの安定性を評価し、PATH 上の全候補をタグ付きで列挙するツール/ライブラリ。
 
@@ -145,4 +147,5 @@ PATH 候補は Unix 実行ビット (`mode & 0o111`) をチェック。入力バ
 ## 関連ドキュメント
 
 - [Design Records](decisions/) — 個別の設計判断とその理由
-- [調査レポート](reports/) — パスパターン、サービス登録の調査結果
+- [パスパターン調査](research/2026-04-09-path-patterns.md) — バイナリの不安定パスパターン網羅調査
+- [サービス登録の制約](findings/2026-04-09-service-registration.md) — launchd / systemd でのバイナリパスの制約
