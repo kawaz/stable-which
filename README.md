@@ -103,6 +103,7 @@ Options:
     --format <F>     Output format: path (default), json
     --policy <P>     Scoring policy: same-binary (default), stable
     --inspect        Show all candidates as JSON (same as --all --format json)
+    -q, --quiet      Suppress warnings
     --help           Show this help message
     --version        Show version
 ```
