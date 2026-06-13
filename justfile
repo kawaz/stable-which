@@ -1,4 +1,6 @@
-# stable-which
+# stable-which justfile
+
+set shell := ["bash", "-euo", "pipefail", "-c"]
 
 # デフォルト: レシピ一覧
 default:
@@ -25,40 +27,46 @@ fmt:
 run *ARGS: build
     ./target/release/stable-which {{ARGS}}
 
-# リリース (bump: major, minor, patch)
-release bump="patch":
+# [workspace.package] version を bump する (bump: major / minor / patch)
+# version 値を Cargo.toml に書き込むだけ。commit/push はしない。
+# tag は release.yml が打つ。
+bump bump="patch":
     #!/usr/bin/env bash
     set -euo pipefail
-
-    # Pre-checks
-    cargo fmt --check --all || { echo "Error: Run 'cargo fmt' first." >&2; exit 1; }
-    cargo clippy --workspace -- -D warnings
-    cargo test --workspace
-
-    # Version bump (update both crate Cargo.toml files)
-    current=$(grep '^version' crates/stable-which/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    current=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     IFS='.' read -r major minor patchv <<< "$current"
     case "{{bump}}" in
         major) major=$((major + 1)); minor=0; patchv=0 ;;
         minor) minor=$((minor + 1)); patchv=0 ;;
         patch) patchv=$((patchv + 1)) ;;
-        *) echo "Error: Invalid bump type '{{bump}}'" >&2; exit 1 ;;
+        *) echo "Error: Invalid bump type '{{bump}}' (use major/minor/patch)" >&2; exit 1 ;;
     esac
     new_version="${major}.${minor}.${patchv}"
-    sed -i '' "s/^version = \"${current}\"/version = \"${new_version}\"/" crates/stable-which/Cargo.toml crates/stable-which-cli/Cargo.toml
+    # BSD/GNU 両対応: perl -i で in-place 置換
+    perl -i -pe "s/^version = \"${current}\"/version = \"${new_version}\"/" Cargo.toml
     cargo check --quiet
     echo "Version: ${current} -> ${new_version}"
 
-    # Commit, tag, push
+# main へ push する (push-guard hook の正規経路)
+push:
+    jj git push --bookmark main
+
+# リリース: bump → check → commit → push
+# tag は release.yml が自動で打つ。手動で tag を打たない。
+release bump="patch": (bump bump)
+    #!/usr/bin/env bash
+    set -euo pipefail
+    new_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+    # CI チェック
+    cargo fmt --check --all || { echo "Error: Run 'just fmt' first." >&2; exit 1; }
+    cargo clippy --workspace -- -D warnings
+    cargo test --workspace
+
+    # commit + push (jj 経由)
     jj describe -m "Release v${new_version}"
     jj new
     jj bookmark set main -r @-
-    jj tag set "v${new_version}" -r @-
-    jj git push --bookmark main
-    jj git export
-    GIT_WORK_TREE="$(pwd)" git --git-dir="$(jj root)/../.git" push origin "v${new_version}"
+    just push
 
-    # Watch workflow
-    sleep 3
-    run_id=$(gh run list --repo kawaz/stable-which --limit 1 --json databaseId -q '.[0].databaseId')
-    gh run watch "$run_id" --repo kawaz/stable-which
+    echo "Pushed v${new_version} to main. release.yml will create the tag and GH Release."

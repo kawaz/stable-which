@@ -2,14 +2,94 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "Cargo.toml"
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.current }}
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install bump-semver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST=$(gh release list --repo kawaz/bump-semver --limit 1 --json tagName -q '.[0].tagName' | sed 's/^v//')
+          curl -fsSL --retry 5 --retry-delay 2 --max-time 60 \
+            "https://github.com/kawaz/bump-semver/releases/download/v${LATEST}/bump-semver-linux-amd64" \
+            -o /usr/local/bin/bump-semver
+          chmod +x /usr/local/bin/bump-semver
+          bump-semver --version
+
+      - name: Check version change
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # [workspace.package] version = "X.Y.Z" から抽出
+          CURRENT_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "current=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+          # semver 形式の検証
+          if ! bump-semver get "$CURRENT_VERSION" -qq; then
+            echo "::error::Invalid version format in Cargo.toml: ${CURRENT_VERSION}"
+            exit 1
+          fi
+
+          # 既存 tag より大きいか検証 (二重リリース防止)
+          set +e
+          LATEST=$(bump-semver vcs get latest-tag --include-prerelease --vcs git 2>/dev/null)
+          LATEST_EXIT=$?
+          set -e
+          if [ "$LATEST_EXIT" -ne 0 ]; then
+            echo "vcs get latest-tag exited ${LATEST_EXIT} (no SemVer tags yet); assuming first release"
+          else
+            set +e
+            bump-semver compare gt "$CURRENT_VERSION" "$LATEST"
+            CMP_EXIT=$?
+            set -e
+            case "$CMP_EXIT" in
+              0)
+                # CURRENT_VERSION > latest tag: release 続行
+                ;;
+              1)
+                # CURRENT_VERSION <= latest tag: 既にリリース済 or 巻き戻し
+                echo "changed=false" >> "$GITHUB_OUTPUT"
+                echo "Version v${CURRENT_VERSION} is not greater than latest tag ${LATEST}; skipping release."
+                exit 0
+                ;;
+              *)
+                echo "::error::Unexpected exit code from bump-semver compare: ${CMP_EXIT}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          # gh release で既存確認 (compare で通っても念のため)
+          if gh release view "v${CURRENT_VERSION}" --repo "$REPO" >/dev/null 2>&1; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Version v${CURRENT_VERSION} already released; skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New version detected: v${CURRENT_VERSION}"
+          fi
+
   build:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
     strategy:
       matrix:
         include:
@@ -74,26 +154,31 @@ jobs:
           path: stable-which-${{ matrix.target }}.tar.gz
 
   release:
-    needs: build
+    needs: [check-version, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
 
-      - name: Create release
+      - name: Create release with tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ needs.check-version.outputs.version }}
+          COMMIT_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release create "$TAG_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG_NAME" \
+          gh release create "v${VERSION}" \
+            --repo "$REPO" \
+            --title "v${VERSION}" \
+            --target "$COMMIT_SHA" \
             --generate-notes \
             stable-which-*.tar.gz
 
   publish-crate:
-    needs: build
+    needs: [check-version, build]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
@@ -114,7 +199,7 @@ jobs:
         run: cargo publish -p stable-which
 
   update-homebrew:
-    needs: release
+    needs: [check-version, release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -124,14 +209,18 @@ jobs:
       - name: Calculate checksums
         id: checksums
         run: |
-          echo "darwin_arm64=$(sha256sum stable-which-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "darwin_amd64=$(sha256sum stable-which-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_arm64=$(sha256sum stable-which-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "linux_amd64=$(sha256sum stable-which-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          {
+            echo "darwin_arm64=$(sha256sum stable-which-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)"
+            echo "darwin_amd64=$(sha256sum stable-which-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)"
+            echo "linux_arm64=$(sha256sum stable-which-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)"
+            echo "linux_amd64=$(sha256sum stable-which-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Get version
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout homebrew-tap
         uses: actions/checkout@v5
@@ -142,7 +231,7 @@ jobs:
 
       - name: Update formula
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.check-version.outputs.version }}
           SHA_DARWIN_ARM64: ${{ steps.checksums.outputs.darwin_arm64 }}
           SHA_DARWIN_AMD64: ${{ steps.checksums.outputs.darwin_amd64 }}
           SHA_LINUX_ARM64: ${{ steps.checksums.outputs.linux_arm64 }}
@@ -189,7 +278,7 @@ jobs:
 
       - name: Commit and push
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.check-version.outputs.version }}
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
