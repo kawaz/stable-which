@@ -1,5 +1,9 @@
 # stable-which
 
+[![crates.io](https://img.shields.io/crates/v/stable-which.svg)](https://crates.io/crates/stable-which)
+[![docs.rs](https://docs.rs/stable-which/badge.svg)](https://docs.rs/stable-which)
+[![CI](https://github.com/kawaz/stable-which/actions/workflows/ci.yml/badge.svg)](https://github.com/kawaz/stable-which/actions/workflows/ci.yml)
+
 Evaluate binary path stability and find stable PATH candidates.
 
 ## Problem

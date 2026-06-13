@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! Evaluate binary path stability and find stable PATH candidates.
 //!
 //! This library analyzes binary paths, tags them with observed attributes

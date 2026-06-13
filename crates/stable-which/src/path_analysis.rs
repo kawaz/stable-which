@@ -110,19 +110,32 @@ pub fn is_build_output(path: &Path) -> bool {
 /// Checks path components (split by `-`, `_`, `.`) case-insensitively for
 /// `cache`, `tmp`, `temp`, or `temporary`. Excludes the portion of the path
 /// before `.app/` to avoid false positives from macOS app bundle names.
+///
+/// Backslash separators (Windows-style paths) are normalized to `/` before
+/// analysis so that this function produces correct results when Windows paths
+/// are evaluated in a string-comparison context (e.g. cross-platform tests).
 pub fn is_ephemeral(path: &Path) -> bool {
-    let parent = match path.parent() {
-        Some(p) => p.to_string_lossy(),
+    // Normalize separators first so that Windows-style backslash paths
+    // (`C:\Users\u\Temp\app`) are handled uniformly on all platforms.
+    let full = normalize_separators(&path.to_string_lossy());
+
+    // Strip the last component (the file name) to get the parent portion.
+    // We work on the normalized string rather than calling `path.parent()`
+    // because on Unix, `Path::new(r"C:\foo\bar")` is a single component and
+    // its `parent()` returns `Some("")`, preventing any match.
+    let parent = match full.rfind('/') {
+        Some(pos) => &full[..pos],
         None => return false,
     };
-
-    let parent = normalize_separators(&parent);
+    if parent.is_empty() {
+        return false;
+    }
 
     // .app bundle exclusion: only evaluate the path after .app/
     let check_target = if let Some(pos) = parent.find(".app/") {
         &parent[pos + 5..]
     } else {
-        &parent
+        parent
     };
 
     for component in check_target.split('/') {
@@ -716,5 +729,81 @@ mod tests {
     #[test]
     fn test_is_executable_false_nonexistent() {
         assert!(!is_executable(Path::new("/nonexistent/path")));
+    }
+
+    // --- Windows backslash path tests (run on all platforms via normalize_separators) ---
+
+    // is_build_output: Windows target\release path
+    #[test]
+    fn test_build_output_windows_target_release() {
+        assert!(is_build_output(Path::new(
+            r"C:\Users\u\project\target\release\app.exe"
+        )));
+    }
+
+    // is_build_output: Windows target\debug path
+    #[test]
+    fn test_build_output_windows_target_debug() {
+        assert!(is_build_output(Path::new(
+            r"C:\Users\u\project\target\debug\app.exe"
+        )));
+    }
+
+    // is_ephemeral: Windows temp directory
+    #[test]
+    fn test_ephemeral_windows_temp() {
+        assert!(is_ephemeral(Path::new(
+            r"C:\Users\u\AppData\Local\Temp\app"
+        )));
+    }
+
+    // is_ephemeral: Windows cache directory
+    #[test]
+    fn test_ephemeral_windows_cache() {
+        assert!(is_ephemeral(Path::new(
+            r"C:\Users\u\AppData\Local\cache\app"
+        )));
+    }
+
+    // detect_version_manager: Windows scoop installs path
+    #[test]
+    fn test_detect_windows_scoop() {
+        let path = Path::new(r"C:\Users\u\scoop\apps\node\22.0.0\node.exe");
+        let result = detect_version_manager(path).unwrap();
+        assert_eq!(result.name, "scoop");
+    }
+
+    // detect_version_manager: Windows chocolatey path
+    #[test]
+    fn test_detect_windows_chocolatey() {
+        let path = Path::new(r"C:\ProgramData\chocolatey\lib\node\tools\node.exe");
+        let result = detect_version_manager(path).unwrap();
+        assert_eq!(result.name, "chocolatey");
+    }
+
+    // is_shim_path: Windows scoop shims path
+    #[test]
+    fn test_shim_windows_scoop() {
+        assert!(is_shim_path(Path::new(r"C:\Users\u\scoop\shims\foo.exe")));
+    }
+
+    // is_shim_path: Windows chocolatey bin path
+    #[test]
+    fn test_shim_windows_chocolatey_bin() {
+        assert!(is_shim_path(Path::new(
+            r"C:\ProgramData\chocolatey\bin\foo.exe"
+        )));
+    }
+
+    // is_build_output: not a build output for normal Windows system binary
+    #[test]
+    fn test_not_build_output_windows_system32() {
+        assert!(!is_build_output(Path::new(r"C:\Windows\System32\cmd.exe")));
+    }
+
+    // is_ephemeral: not ephemeral for normal Windows system binary
+    #[test]
+    fn test_not_ephemeral_windows_system32() {
+        assert!(!is_ephemeral(Path::new(r"C:\Windows\System32\cmd.exe")));
     }
 }

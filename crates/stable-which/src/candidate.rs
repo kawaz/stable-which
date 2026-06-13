@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::durability::{self, Durability};
 use crate::path_analysis;
 
+/// Errors that can be returned by [`find_candidates`] and related functions.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -49,6 +50,10 @@ impl std::error::Error for Error {
     }
 }
 
+/// Observed properties of a candidate path.
+///
+/// Tags describe how a candidate was found and what role it plays. Multiple
+/// tags can be attached to a single candidate. See [`Candidate::tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PathTag {
@@ -95,11 +100,25 @@ pub struct Candidate {
     tags: Vec<PathTag>,
 }
 
+/// Policy for ranking candidates returned by [`rank_candidates`].
+///
+/// The two policies differ in whether binary identity or path stability
+/// is the primary criterion. See [`rank_candidates`] for usage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScoringPolicy {
+    /// Prefer the candidate that points to the **same binary** as the input
+    /// (by canonical path or content), then break ties by path stability.
+    ///
+    /// This is the default and is appropriate for service registration, where
+    /// the exact same binary file must be referenced.
     #[default]
     SameBinary,
+    /// Prefer the candidate with the most **stable path**, then break ties by
+    /// binary identity.
+    ///
+    /// Useful for configuration files that should survive binary upgrades
+    /// (the path keeps working even if the underlying file changes).
     Stable,
 }
 
