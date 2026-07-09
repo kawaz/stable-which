@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-07-09
+
+### Changed
+
+- **`~/.cargo/bin`, `~/go/bin`, `~/.moon/bin` promoted from `Unknown` to
+  `Durable`**: all three are direct-install surfaces whose owning installer
+  (`cargo install` / `go install` / `moon upgrade`) overwrites the binary in
+  place at the same path on every install/upgrade (no versioned tree), and
+  rustup's toolchain-proxy binaries (`rustc`, `cargo`, ...) also live in
+  `~/.cargo/bin` without moving on toolchain switches — they now qualify as
+  durable reference surfaces (DR-016 Decision 5 / its 2026-07-09 addendum;
+  `Unknown → Durable` is a non-breaking refinement). The match is strict and
+  HOME-anchored (`<home><dir>/<file>`, a single direct file segment); a
+  project-local `/repo/.cargo/bin/tool` or an unresolved `HOME` still falls
+  through to `Unknown`.
+
+## [0.4.2] — 2026-06-13
+
+### Fixed
+
+- **Windows test gating**: guard the 14 tests that expect `Durability::Durable`
+  for Unix absolute paths (`/usr/bin`, `/opt/homebrew/bin`, etc.) behind
+  `#[cfg(unix)]`. `Path::is_absolute()` returns `false` for these paths on
+  Windows (no drive letter), so `is_durable_direct_dir` /
+  `is_etc_profiles_per_user_bin` always return `false` there and the
+  candidates fall through to `Unknown` instead of `Durable`; the tests would
+  otherwise fail on Windows CI.
+
+### Documentation
+
+- Document the Windows behavior of the durable-location allow-list on
+  `Durability` and `judge`: on Windows all such paths fall through to
+  `Unknown` (the safe side) until native Windows durable-location support
+  (`C:\Windows\System32`, scoop/chocolatey/winget bins, etc.) lands in 0.5.x.
+  Tracked in `docs/issue/2026-06-13-windows-durable-location.md`.
+
 ## [0.4.1] — 2026-06-13
 
 ### Fixed

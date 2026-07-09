@@ -135,7 +135,7 @@ Each candidate is also judged on an orthogonal **durability** axis (`durable` /
 path be baked into a launchd plist / systemd unit and survive upgrade and
 reboot?":
 
-- **durable**: environment-wide reference surfaces (`/usr/bin`, `/opt/homebrew/bin`, profile bins, standard shim dirs)
+- **durable**: environment-wide reference surfaces (`/usr/bin`, `/opt/homebrew/bin`, profile bins, standard shim dirs, direct-install dirs like `~/.cargo/bin` / `~/go/bin`)
 - **not-durable**: versioned installs (`Cellar/`, `nix/store/`, `installs/`), ephemeral / build-output / project-local paths
 - **unknown**: unrecognized locations and user dropboxes (`~/bin`, `~/.local/bin`) — treated as not safe to pin (safe side)
 

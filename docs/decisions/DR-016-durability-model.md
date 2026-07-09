@@ -100,6 +100,26 @@ durability は **候補ごとに評価する**。同一の binary でも、参�
 - **理由**: 限界を doc 化しておくことで、利用者が「durable と出たのに壊れた」ケースの原因を理解でき、過信を防げる（`document-design-rationale` の趣旨）。
 - **影響**: cache-warden は doc の限界を踏まえ、必要なら realpath 検証等の追加チェックを上位で実装できる。
 
+### 追記 (2026-07-09, v0.5.0): HOME-anchored direct-install 面の昇格
+
+Decision 5 の精緻化路線に沿った最初の `Unknown → Durable` 昇格として、
+**`~/.cargo/bin` / `~/go/bin` / `~/.moon/bin`** を durable allow-list に追加した
+(`HOME_ANCHORED_DIRECT_DIRS`)。
+
+- **根拠**: findings fact 7 — 3 面とも「installer (cargo install / go install /
+  moon upgrade) が同一パスへ in-place 上書きし、versioned tree を作らない」という
+  同一の性質を実機確認済み。同一根拠の面を一部だけ昇格すると「意図的後回しか
+  見落としか」が判別不能になるため 3 面同時に昇格する
+- **Decision 3 との整合**: user dropbox (`~/bin` / `~/.local/bin`) の除外理由は
+  「不特定ツールの versioned symlink / shebang スクリプトの混在」。これら 3 面は
+  単一の well-known installer が支配する専用面であり除外理由に該当しない。
+  マッチは shim と同じ HOME アンカー + 直下 1 セグメントの厳密構造
+- **残存リスク**: user-writable な PATH 上ディレクトリなので、第三者ツールや手動
+  `ln -s` が versioned symlink を置く可能性は排除できない (`/usr/local/bin` と
+  同クラスの既知 limitation)。コード側 doc comment に明記
+- **スコープ外**: Windows-native 面 (scoop shims 等) は引き続き 0.5.x 以降の
+  別 issue。環境依存面 (`~/.nix-profile` 等) は判別不能のため `Unknown` のまま
+
 ## Consequences
 
 - `is_stable()` が「durable-to-pin」の正しい意味になり、cache-warden の versioned-managed 見落としバグ（versioned-install を durable と誤認していた）が同時に埋まる。

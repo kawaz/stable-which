@@ -26,14 +26,18 @@ use crate::path_analysis;
 ///    build-output / project-local patterns.
 /// 2. Otherwise, if the path is under a known durable location (the
 ///    "environment-wide reference surfaces": standard system bins, profile
-///    bins matched by their exact structure, and shims at standard
-///    HOME-anchored locations), it is `Durable`.
+///    bins matched by their exact structure, shims at standard HOME-anchored
+///    locations, and HOME-anchored direct-install dirs such as
+///    `~/.cargo/bin`), it is `Durable`.
 /// 3. Otherwise `Unknown` (treated as not-durable by
 ///    [`Candidate::is_stable`](crate::Candidate::is_stable)).
 ///
 /// User dropbox directories (`~/bin`, `~/.local/bin`) are deliberately *not*
 /// in the durable allow-list: they mix shebang-embedded scripts and versioned
-/// symlinks, so they fall through to `Unknown`.
+/// symlinks, so they fall through to `Unknown`. `~/.cargo/bin` is not such a
+/// dropbox: `cargo install` overwrites the binary in place at the same path
+/// on every install/upgrade (no per-tool versioned symlink), so it is
+/// included in the allow-list.
 ///
 /// # Platform support
 ///
@@ -182,6 +186,35 @@ const STANDARD_SHIM_SUFFIXES: &[&str] = &[
     "/.proto/shims",
 ];
 
+/// HOME-anchored direct-install directory suffixes: individual tools install
+/// their binary directly here (`<home><suffix>/<file>`), overwriting the same
+/// path on every install/upgrade rather than writing a versioned tree, so the
+/// path string stays durable across upgrades.
+///
+/// Design rationale: each entry is a directory whose owning installer
+/// (`cargo install` / `go install` / `moon upgrade`) writes the binary in
+/// place at the same path on every install/upgrade — no versioned tree, so
+/// the path string keeps pointing at the current binary (findings
+/// `2026-06-13-binary-path-durability-matrix` fact 7; promoted per DR-016
+/// Decision 5's `Unknown → Durable` refinement path). rustup's
+/// toolchain-proxy binaries (`rustc`, `cargo`, `rustfmt`, ...) also live in
+/// `~/.cargo/bin` and redirect internally to the active toolchain without
+/// moving this path. Unlike `~/.local/bin` (Decision 3 of DR-016), these
+/// directories are populated by a single, well-known installer rather than an
+/// ad-hoc mix of shebang scripts and versioned symlinks.
+///
+/// Residual risk (same class as the `/usr/local/bin` note on
+/// [`DURABLE_DIRECT_DIRS`]): these are user-writable directories on PATH, so
+/// an unrelated tool or a manual `ln -s` can place a *versioned symlink* here
+/// (e.g. via `cargo-binstall` or a curl-pipe installer). Such a path would be
+/// judged `Durable` yet break on upgrade — a known limitation of path-string
+/// judgement, documented on [`Durability`].
+const HOME_ANCHORED_DIRECT_DIRS: &[&str] = &[
+    "/.cargo/bin", // cargo install / rustup proxies
+    "/go/bin",     // go install (default GOPATH)
+    "/.moon/bin",  // moon (MoonBit toolchain)
+];
+
 /// Normalize a path string to forward slashes for pattern matching.
 fn norm(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
@@ -255,15 +288,14 @@ fn is_durable_direct_dir(path: &Path) -> bool {
     DURABLE_DIRECT_DIRS.iter().any(|&d| parent_s == d)
 }
 
-/// Whether `path` is a shim at a standard HOME-anchored location.
+/// Whether `path` is `<home><suffix>/<file>` for one of `suffixes`:
+/// HOME-anchored, with exactly one of the given suffix directories, then a
+/// single file segment (no further `/`). Shared by [`is_standard_shim`] and
+/// [`is_home_anchored_direct_dir`].
 ///
-/// `home` is the resolved HOME directory; when `None`, a HOME-anchored shim
-/// cannot be confirmed and the function returns `false` (→ `Unknown`).
-fn is_standard_shim(path: &Path, home: Option<&Path>) -> bool {
-    // The shim must be recognized as a shim by the shared detector first.
-    if !path_analysis::is_shim_path(path) {
-        return false;
-    }
+/// `home` is the resolved HOME directory; when `None`, HOME-anchoring cannot
+/// be confirmed and the function returns `false` (→ `Unknown`).
+fn is_home_anchored_suffix_dir(path: &Path, home: Option<&Path>, suffixes: &[&str]) -> bool {
     let Some(home) = home else {
         return false;
     };
@@ -281,11 +313,8 @@ fn is_standard_shim(path: &Path, home: Option<&Path>) -> bool {
         return false;
     }
     let s = norm(path);
-    // The shim dir must be `<home><suffix>/<file>`: HOME-anchored, with exactly
-    // the standard shims directory, then a single file segment.
-    STANDARD_SHIM_SUFFIXES.iter().any(|suffix| {
-        let dir = format!("{home_s}{suffix}");
-        let with_sep = format!("{dir}/");
+    suffixes.iter().any(|suffix| {
+        let with_sep = format!("{home_s}{suffix}/");
         // `s` starts with `<home><suffix>/` and the remainder is a single file
         // segment (no further `/`).
         s.strip_prefix(&with_sep)
@@ -293,15 +322,30 @@ fn is_standard_shim(path: &Path, home: Option<&Path>) -> bool {
     })
 }
 
+/// Whether `path` is a shim at a standard HOME-anchored location.
+fn is_standard_shim(path: &Path, home: Option<&Path>) -> bool {
+    // The shim must be recognized as a shim by the shared detector first.
+    path_analysis::is_shim_path(path)
+        && is_home_anchored_suffix_dir(path, home, STANDARD_SHIM_SUFFIXES)
+}
+
+/// Whether `path` is a direct install destination at a standard HOME-anchored
+/// location (`~/.cargo/bin` etc; see [`HOME_ANCHORED_DIRECT_DIRS`]).
+fn is_home_anchored_direct_dir(path: &Path, home: Option<&Path>) -> bool {
+    is_home_anchored_suffix_dir(path, home, HOME_ANCHORED_DIRECT_DIRS)
+}
+
 /// Detect whether a path lives at a known durable reference surface.
 ///
 /// Each surface is matched by its exact structure (direct-dir parent equality,
-/// the strict per-user profile shape, or a HOME-anchored standard shim), never
-/// by loose substring. Unrecognized locations fall through to `Unknown`.
+/// the strict per-user profile shape, or a HOME-anchored standard shim or
+/// direct-install dir), never by loose substring. Unrecognized locations fall
+/// through to `Unknown`.
 fn is_durable_location(path: &Path, home: Option<&Path>) -> bool {
     is_durable_direct_dir(path)
         || is_etc_profiles_per_user_bin(path)
         || is_standard_shim(path, home)
+        || is_home_anchored_direct_dir(path, home)
 }
 
 /// Judge the durability of a candidate path, resolving HOME from the process
@@ -546,6 +590,33 @@ mod tests {
         );
     }
 
+    // `cargo install` overwrites the binary in place at the same path on
+    // every install/upgrade (no versioned tree), so ~/.cargo/bin is a durable
+    // reference surface (promoted from Unknown; see HOME_ANCHORED_DIRECT_DIRS).
+    #[cfg(unix)]
+    #[test]
+    fn cargo_bin_is_durable() {
+        assert_eq!(judge_str("/home/u/.cargo/bin/ripgrep"), Durability::Durable);
+    }
+
+    // `go install` writes to $GOPATH/bin (default ~/go/bin), overwriting the
+    // same path on every install — same in-place model as cargo (findings
+    // fact 7), so the default location is a durable reference surface.
+    #[cfg(unix)]
+    #[test]
+    fn go_bin_is_durable() {
+        assert_eq!(judge_str("/home/u/go/bin/gopls"), Durability::Durable);
+    }
+
+    // moon (MoonBit) installs its toolchain binaries at ~/.moon/bin and
+    // upgrades in place at the same path — same in-place model (findings
+    // fact 7), so it is a durable reference surface.
+    #[cfg(unix)]
+    #[test]
+    fn moon_bin_is_durable() {
+        assert_eq!(judge_str("/home/u/.moon/bin/moon"), Durability::Durable);
+    }
+
     // --- A: strict per-user profile structure (false-positive regression) ---
 
     #[test]
@@ -622,6 +693,56 @@ mod tests {
         );
     }
 
+    // --- C: HOME-anchored direct dir false-positive regression ---
+    // Exercised via ~/.cargo/bin; the anchoring/structure mechanism
+    // (is_home_anchored_suffix_dir) is shared by all HOME_ANCHORED_DIRECT_DIRS
+    // entries (go/bin, .moon/bin), so per-entry duplicates add no coverage.
+
+    #[test]
+    fn project_local_cargo_bin_is_unknown() {
+        // `/repo/.cargo/bin/tool` is directly under a dir named `.cargo/bin`
+        // but is NOT anchored under the resolved HOME (project-local
+        // lookalike); must not be promoted to Durable.
+        assert_eq!(
+            judge_with_home(Path::new("/repo/.cargo/bin/tool"), Some(Path::new(HOME))),
+            Durability::Unknown
+        );
+    }
+
+    #[test]
+    fn cargo_bin_without_home_is_unknown() {
+        // HOME unknown → cannot confirm HOME-anchoring → Unknown, even though
+        // the path shape matches `.cargo/bin`.
+        assert_eq!(
+            judge_with_home(Path::new("/home/u/.cargo/bin/ripgrep"), None),
+            Durability::Unknown
+        );
+    }
+
+    #[test]
+    fn cargo_bin_nested_is_unknown() {
+        // `<home>/.cargo/bin/sub/tool` is not a direct child of `.cargo/bin`
+        // (extra `sub/` segment); the strict "single file segment" structural
+        // match must reject it.
+        assert_eq!(
+            judge_with_home(
+                Path::new("/home/u/.cargo/bin/sub/tool"),
+                Some(Path::new(HOME))
+            ),
+            Durability::Unknown
+        );
+    }
+
+    #[test]
+    fn cargo_binx_lookalike_is_unknown() {
+        // `.cargo/binx` is a similar-looking but distinct directory name; the
+        // exact-suffix match must not treat it as `.cargo/bin`.
+        assert_eq!(
+            judge_with_home(Path::new("/home/u/.cargo/binx/tool"), Some(Path::new(HOME))),
+            Durability::Unknown
+        );
+    }
+
     // --- Unknown: user dropbox and unrecognized locations ---
 
     #[test]
@@ -633,13 +754,6 @@ mod tests {
     #[test]
     fn home_bin_is_unknown() {
         assert_eq!(judge_str("/home/u/bin/mytool"), Durability::Unknown);
-    }
-
-    #[test]
-    fn cargo_bin_is_unknown() {
-        // ~/.cargo/bin is durable in practice but not in the allow-list yet;
-        // safe side = Unknown (0.5.x may promote).
-        assert_eq!(judge_str("/home/u/.cargo/bin/ripgrep"), Durability::Unknown);
     }
 
     #[test]
